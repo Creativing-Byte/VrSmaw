@@ -442,7 +442,13 @@ public void BeginSession()
         // For P2_T: ignore pauses longer than 8 s — that duration means the student
         // was rotating the piece between front and reverso passes, which is correct
         // technique and must not be counted as a continuity failure.
-        if (arcActive && !_arcWasActive && _arcGapTimerMs >= config.continuityPauseThresholdMs)
+        //
+        // Guard: _totalArcFrames == 0 means this is the VERY FIRST arc activation
+        // of the session.  The gap timer has been accumulating since session start
+        // (student navigating to the piece, positioning, etc.) — that pre-welding
+        // time must NOT be penalised as a continuity pause.
+        if (arcActive && !_arcWasActive && _arcGapTimerMs >= config.continuityPauseThresholdMs
+            && _totalArcFrames > 0)
         {
             bool isRotationPause = selectedExercise == ExerciseType.P2_T
                                 && _arcGapTimerMs > 8000f;
@@ -487,9 +493,17 @@ public void BeginSession()
         }
 
         // ── C3: Ángulo trabajo 45° ───────────────────────────────────────────
+        // VRControllerWeldSensor reports pitch RELATIVE to the calibrated zero pose
+        // (= 0° when holding the exact position at calibration time).
+        // The student calibrates at the correct 45° work angle, so "good" = stay near 0°.
+        //
+        // Arduino IMU reports ABSOLUTE angle, so we compare against config.workAngle45Deg.
         if (criteriaResults[2].applicable)
         {
-            if (Mathf.Abs(t.pitchDeg - config.workAngle45Deg) > config.workAngle45ToleranceDeg)
+            float c3Target = (controllerSensor != null && controllerSensor.IsTracking)
+                             ? 0f                       // VR: deviation from calibrated pose
+                             : config.workAngle45Deg;   // Arduino IMU: absolute 45°
+            if (Mathf.Abs(t.pitchDeg - c3Target) > config.workAngle45ToleranceDeg)
                 _c3ViolFrames++;
         }
 
@@ -549,9 +563,12 @@ public void BeginSession()
         var c3 = criteriaResults[2];
         if (c3.applicable)
         {
-            violRate   = (float)_c3ViolFrames / _totalArcFrames;
-            c3.score   = 100f * (1f - violRate);
-            c3.details = $"Muestras fuera de {config.workAngle45Deg}° ±{config.workAngle45ToleranceDeg}°: {_c3ViolFrames}/{_totalArcFrames}";
+            violRate = (float)_c3ViolFrames / _totalArcFrames;
+            c3.score = 100f * (1f - violRate);
+            bool usingController = controllerSensor != null && controllerSensor.IsTracking;
+            c3.details = usingController
+                ? $"Muestras fuera de posición calibrada ±{config.workAngle45ToleranceDeg}°: {_c3ViolFrames}/{_totalArcFrames}"
+                : $"Muestras fuera de {config.workAngle45Deg}° ±{config.workAngle45ToleranceDeg}°: {_c3ViolFrames}/{_totalArcFrames}";
         }
 
         // C4 – Adaptación 13°

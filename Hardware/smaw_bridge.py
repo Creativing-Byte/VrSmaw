@@ -2,22 +2,23 @@
 """
 SMAW Bridge — conecta el Arduino Uno con el Quest 3 vía UDP.
 
+Zero config: no hay que saber la IP del Quest.
+El bridge hace broadcast de la telemetría al segmento de red local;
+el Quest la recibe, descubre automáticamente la IP del bridge y
+envía los comandos de vuelta.
+
 Flujo:
-  Arduino (Serial) ---> bridge ---> UDP:9100 ---> Quest 3  (telemetría)
-  Quest 3 ---> UDP:9101 ---> bridge ---> Serial ---> Arduino  (comandos servo)
+  Arduino (Serial) ---> bridge ---> UDP broadcast:9100 ---> Quest 3
+  Quest 3 ---> UDP:9101 ---> bridge ---> Serial ---> Arduino
 
 Uso:
-  python smaw_bridge.py --quest <IP_QUEST>
-
-Ejemplo:
-  python smaw_bridge.py --quest 192.168.1.50
+  python smaw_bridge.py
 
 Opciones:
-  --quest   IP del Quest 3 en la red WiFi  (obligatorio)
-  --port    Puerto serial del Arduino      (default: auto-detect)
-  --baud    Baudios                        (default: 115200)
-  --in      Puerto UDP recepción telemetría (default: 9100, igual que Unity espera)
-  --out     Puerto UDP recepción comandos  (default: 9101)
+  --port   Puerto serial del Arduino (default: auto-detect)
+  --baud   Baudios               (default: 115200)
+  --tin    Puerto telemetría saliente  (default: 9100)
+  --cin    Puerto comandos entrantes   (default: 9101)
 
 Dependencias:
   pip install pyserial
@@ -31,18 +32,15 @@ import threading
 import time
 import sys
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
+TELEMETRY_UDP_PORT = 9100   # Quest escucha aquí
+COMMAND_UDP_PORT   = 9101   # Bridge escucha aquí, recibe comandos del Quest
+BROADCAST_ADDR     = "255.255.255.255"
 
-TELEMETRY_UDP_PORT = 9100   # Quest escucha aquí (ArduinoBridgeReceiver)
-COMMAND_UDP_PORT   = 9101   # Bridge escucha aquí, recibe comandos de Quest
+ARDUINO_HINTS = ["Arduino", "usbmodem", "wchusbserial", "ttyACM", "ttyUSB", "CH340", "CP210"]
 
 # ---------------------------------------------------------------------------
 # Serial auto-detect
 # ---------------------------------------------------------------------------
-
-ARDUINO_HINTS = ["Arduino", "usbmodem", "wchusbserial", "ttyACM", "ttyUSB", "CH340", "CP210"]
 
 def find_arduino_port():
     ports = serial.tools.list_ports.comports()
@@ -51,7 +49,6 @@ def find_arduino_port():
         for hint in ARDUINO_HINTS:
             if hint.lower() in desc.lower():
                 return p.device
-    # Fallback: first available port
     if ports:
         return ports[0].device
     return None
@@ -60,10 +57,13 @@ def find_arduino_port():
 # Bridge threads
 # ---------------------------------------------------------------------------
 
-def serial_to_udp(ser, quest_ip, udp_sock, running):
-    """Lee líneas del Arduino y las reenvía al Quest por UDP."""
-    target = (quest_ip, TELEMETRY_UDP_PORT)
-    print(f"[bridge] Telemetría Serial → UDP {quest_ip}:{TELEMETRY_UDP_PORT}")
+def serial_to_udp(ser, udp_sock, running):
+    """
+    Lee líneas del Arduino y las emite por broadcast UDP.
+    Cualquier dispositivo en la red (Quest 3) las recibe sin config previa.
+    """
+    target = (BROADCAST_ADDR, TELEMETRY_UDP_PORT)
+    print(f"[bridge] Telemetría → broadcast {BROADCAST_ADDR}:{TELEMETRY_UDP_PORT}")
     while running[0]:
         try:
             line = ser.readline()
@@ -77,14 +77,21 @@ def serial_to_udp(ser, quest_ip, udp_sock, running):
             break
 
 def udp_to_serial(ser, cmd_sock, running):
-    """Escucha comandos de Unity/Quest y los escribe al Arduino por Serial."""
-    print(f"[bridge] Comandos UDP:{COMMAND_UDP_PORT} → Serial")
+    """
+    Escucha comandos del Quest y los escribe al Arduino.
+    Imprime la IP del Quest la primera vez para confirmar la conexión.
+    """
+    print(f"[bridge] Comandos ← UDP:{COMMAND_UDP_PORT}")
     cmd_sock.settimeout(1.0)
+    known_quest_ip = None
     while running[0]:
         try:
             data, addr = cmd_sock.recvfrom(64)
             if data:
-                ser.write(data)   # ya viene con \n incluido
+                if addr[0] != known_quest_ip:
+                    known_quest_ip = addr[0]
+                    print(f"[bridge] Quest conectado desde {addr[0]}")
+                ser.write(data)
         except socket.timeout:
             continue
         except OSError:
@@ -95,22 +102,17 @@ def udp_to_serial(ser, cmd_sock, running):
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="SMAW Arduino ↔ Quest 3 UDP bridge")
-    parser.add_argument("--quest", required=True, help="IP del Quest 3 en la red WiFi")
-    parser.add_argument("--port",  default=None,  help="Puerto serial del Arduino (ej: COM3 o /dev/ttyACM0)")
-    parser.add_argument("--baud",  default=115200, type=int)
+    parser = argparse.ArgumentParser(description="SMAW Arduino ↔ Quest 3 UDP bridge (zero-config)")
+    parser.add_argument("--port", default=None, help="Puerto serial (ej: COM3 o /dev/ttyACM0)")
+    parser.add_argument("--baud", default=115200, type=int)
     args = parser.parse_args()
 
     # --- Resolve serial port ---
-    port = args.port
+    port = args.port or find_arduino_port()
     if port is None:
-        port = find_arduino_port()
-        if port is None:
-            print("[bridge] ERROR: no se encontró el Arduino. Conecta el USB o usa --port.")
-            sys.exit(1)
-        print(f"[bridge] Arduino detectado en: {port}")
-    else:
-        print(f"[bridge] Usando puerto: {port}")
+        print("[bridge] ERROR: no se encontró el Arduino. Conecta el USB o usa --port.")
+        sys.exit(1)
+    print(f"[bridge] Arduino en: {port}")
 
     # --- Open serial ---
     try:
@@ -122,25 +124,22 @@ def main():
         print(f"[bridge] ERROR abriendo serial: {e}")
         sys.exit(1)
 
-    # --- Open UDP sockets ---
+    # --- UDP sockets ---
     udp_send = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp_send.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)  # habilita broadcast
+
     udp_recv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     udp_recv.bind(("0.0.0.0", COMMAND_UDP_PORT))
-    print(f"[bridge] Quest IP: {args.quest}")
 
     running = [True]
 
-    t1 = threading.Thread(target=serial_to_udp,
-                          args=(ser, args.quest, udp_send, running),
-                          daemon=True)
-    t2 = threading.Thread(target=udp_to_serial,
-                          args=(ser, udp_recv, running),
-                          daemon=True)
+    t1 = threading.Thread(target=serial_to_udp, args=(ser, udp_send, running), daemon=True)
+    t2 = threading.Thread(target=udp_to_serial, args=(ser, udp_recv, running), daemon=True)
 
     t1.start()
     t2.start()
 
-    print("[bridge] Corriendo. Ctrl+C para detener.")
+    print("[bridge] Corriendo — esperando Quest 3 en la red. Ctrl+C para detener.")
     try:
         while running[0]:
             time.sleep(0.5)
@@ -148,9 +147,12 @@ def main():
         print("\n[bridge] Deteniendo...")
 
     running[0] = False
-    ser.close()
-    udp_send.close()
-    udp_recv.close()
+    try: ser.close()
+    except: pass
+    try: udp_send.close()
+    except: pass
+    try: udp_recv.close()
+    except: pass
     t1.join(timeout=2)
     t2.join(timeout=2)
     print("[bridge] Cerrado.")

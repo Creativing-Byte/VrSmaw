@@ -93,6 +93,12 @@ public class ArduinoBridgeReceiver : MonoBehaviour
     private UdpClient _udpSender;
     private bool _keepRunning;
     private bool _hasPendingPayload;
+
+    // Auto-discovered bridge IP: set the first time a UDP telemetry packet is
+    // received. Used as fallback when commandTargetIp is left empty, so the
+    // Quest automatically sends commands back to whoever is sending telemetry
+    // — zero config needed.
+    private volatile string _autoDiscoveredBridgeIp;
     private string _pendingPayload;
 
     // Accessible from main thread for serial writes (set/cleared by ReceiveSerialLoop)
@@ -176,14 +182,20 @@ public class ArduinoBridgeReceiver : MonoBehaviour
         }
 
         // ── UDP send (Quest / any platform with a PC bridge relay) ────────────
-        // Include the newline so the Arduino's readline parser terminates correctly.
-        if (!string.IsNullOrEmpty(commandTargetIp))
+        // Priority: manual commandTargetIp > auto-discovered bridge IP.
+        // With the broadcast bridge (smaw_bridge.py) commandTargetIp can be
+        // left empty — the bridge IP is learned automatically from incoming packets.
+        var targetIp = !string.IsNullOrEmpty(commandTargetIp)
+            ? commandTargetIp
+            : _autoDiscoveredBridgeIp;
+
+        if (!string.IsNullOrEmpty(targetIp))
         {
             try
             {
                 if (_udpSender == null) _udpSender = new UdpClient();
                 var bytes = Encoding.UTF8.GetBytes(cmd + "\n");
-                _udpSender.Send(bytes, bytes.Length, commandTargetIp, commandTargetPort);
+                _udpSender.Send(bytes, bytes.Length, targetIp, commandTargetPort);
             }
             catch (Exception ex)
             {
@@ -349,6 +361,17 @@ public class ArduinoBridgeReceiver : MonoBehaviour
             {
                 var remoteEndPoint = new System.Net.IPEndPoint(System.Net.IPAddress.Any, 0);
                 var bytes = _udpClient.Receive(ref remoteEndPoint);
+
+                // Auto-discover the bridge IP so commands are sent back without
+                // any manual configuration (works with the broadcast bridge script).
+                var senderIp = remoteEndPoint.Address.ToString();
+                if (_autoDiscoveredBridgeIp != senderIp)
+                {
+                    _autoDiscoveredBridgeIp = senderIp;
+                    if (verboseLogging)
+                        Debug.Log($"[ArduinoBridgeReceiver] Bridge descubierto en {senderIp}");
+                }
+
                 var payload = Encoding.UTF8.GetString(bytes);
                 PushPendingPayload(payload);
             }

@@ -101,8 +101,10 @@ public class ArduinoBridgeReceiver : MonoBehaviour
     private volatile string _autoDiscoveredBridgeIp;
     private string _pendingPayload;
 
+#if !UNITY_ANDROID || UNITY_EDITOR
     // Accessible from main thread for serial writes (set/cleared by ReceiveSerialLoop)
     private volatile SerialPortProxy _activeSerialPort;
+#endif
 
     private void Awake()
     {
@@ -170,6 +172,7 @@ public class ArduinoBridgeReceiver : MonoBehaviour
         // ── Serial write (Editor / PC build) ──────────────────────────────────
         // SerialPortProxy.WriteLine appends the NewLine character ("\n") itself,
         // so pass only the raw command string.
+#if !UNITY_ANDROID || UNITY_EDITOR
         var serialPort = _activeSerialPort;
         if (serialPort != null)
         {
@@ -180,6 +183,7 @@ public class ArduinoBridgeReceiver : MonoBehaviour
                     Debug.LogWarning($"[ArduinoBridgeReceiver] Serial write failed: {ex.Message}");
             }
         }
+#endif
 
         // ── UDP send (Quest / any platform with a PC bridge relay) ────────────
         // Priority: manual commandTargetIp > auto-discovered bridge IP.

@@ -49,6 +49,14 @@ static const float LASER_VALID_MIN_MM = 1.0f;
 static const float LASER_VALID_MAX_MM = 120.0f;
 
 // ---------------------------------------------------------------------------
+// Unity command config
+// ---------------------------------------------------------------------------
+
+// If Unity sends no "S:" command within this window, the Arduino falls back
+// to computing its own consumption from arc time (standalone / offline mode).
+static const unsigned long UNITY_COMMAND_TIMEOUT_MS = 2000UL;
+
+// ---------------------------------------------------------------------------
 // Domain config
 // ---------------------------------------------------------------------------
 
@@ -106,6 +114,25 @@ unsigned long lastLoopMicros = 0UL;
 unsigned long rackMotionStartedMs = 0UL;
 
 // ---------------------------------------------------------------------------
+// Unity command state
+//
+// Unity is the source of truth for electrode consumption — the VR simulation
+// drives the physical servo.  The Arduino accepts "S:<0.0-1.0>" commands that
+// set the target servo position directly.
+//
+// If no Unity command is received for UNITY_COMMAND_TIMEOUT_MS the Arduino
+// falls back to its own arc-time calculation so the hardware still works in
+// standalone / offline mode.
+// ---------------------------------------------------------------------------
+
+static float  unityServoTarget     = -1.0f;  // -1 = no Unity command yet
+static unsigned long lastUnityCommandMs = 0UL;
+
+// Incoming command buffer (non-blocking Serial read)
+static char   cmdBuf[24];
+static uint8_t cmdLen = 0;
+
+// ---------------------------------------------------------------------------
 // Forward declarations
 // ---------------------------------------------------------------------------
 
@@ -119,6 +146,9 @@ void updateConsumable(float dt);
 void updateServo(float dt);
 void updateTrackingConfidence();
 void sendTelemetryIfNeeded();
+void handleIncomingCommands();
+void processCommand(const char* cmd, uint8_t len);
+bool hasRecentUnityCommand();
 bool isTriggerPressed();
 bool isArcActive();
 
@@ -150,6 +180,7 @@ void loop()
   const unsigned long nowMicros = micros();
   const float dt = computeDeltaSeconds(nowMicros);
 
+  handleIncomingCommands();   // parse Unity servo commands first
   handleElectrodeButtons();
   updateImu(dt);
   updateLaserIfNeeded();
@@ -195,6 +226,76 @@ void setupServo()
   {
     rackServo.writeMicroseconds(SERVO_CONTINUOUS_NEUTRAL_US);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Incoming Unity command handler
+//
+// Protocol: one ASCII line per command, terminated by '\n'.
+//   S:<float>   — set servo target (0.0 = full electrode, 1.0 = spent)
+//                 e.g. "S:0.350"
+//   R           — reset electrode (same as pressing button, goes home)
+// ---------------------------------------------------------------------------
+
+void handleIncomingCommands()
+{
+  while (Serial.available() > 0)
+  {
+    char c = (char)Serial.read();
+
+    if (c == '\n' || c == '\r')
+    {
+      if (cmdLen > 0)
+      {
+        cmdBuf[cmdLen] = '\0';
+        processCommand(cmdBuf, cmdLen);
+        cmdLen = 0;
+      }
+    }
+    else if (cmdLen < (uint8_t)(sizeof(cmdBuf) - 1))
+    {
+      cmdBuf[cmdLen++] = c;
+    }
+    else
+    {
+      // Buffer overflow — discard line
+      cmdLen = 0;
+    }
+  }
+}
+
+void processCommand(const char* cmd, uint8_t len)
+{
+  // "S:0.350" — Unity servo target
+  if (len >= 3 && cmd[0] == 'S' && cmd[1] == ':')
+  {
+    float target = atof(cmd + 2);
+    if (target >= 0.0f && target <= 1.0f)
+    {
+      unityServoTarget = target;
+      lastUnityCommandMs = millis();
+
+      // Mirror consumed mm so standalone fallback stays in sync
+      consumedMm     = target * MAX_ELECTRODE_TRAVEL_MM;
+      servoNormalized = target;
+    }
+    return;
+  }
+
+  // "R" — Unity requests electrode reset (new electrode inserted)
+  if (len >= 1 && cmd[0] == 'R')
+  {
+    requestElectrodeChange(selectedElectrodeIndex);
+    unityServoTarget = 0.0f;
+    lastUnityCommandMs = millis();
+    return;
+  }
+}
+
+bool hasRecentUnityCommand()
+{
+  return unityServoTarget >= 0.0f &&
+         (millis() - lastUnityCommandMs) < UNITY_COMMAND_TIMEOUT_MS;
 }
 
 // ---------------------------------------------------------------------------
@@ -245,6 +346,8 @@ void requestElectrodeChange(uint8_t index)
   requestedElectrodeIndex = index;
   consumedMm = 0.0f;
   servoNormalized = 0.0f;
+  unityServoTarget = 0.0f;    // also reset Unity target so servo goes home
+  lastUnityCommandMs = millis();
   rackMotionState = RACK_MOTION_RETURNING_HOME;
   rackMotionStartedMs = millis();
 
@@ -265,6 +368,7 @@ void completeElectrodeChange()
   consumedMm = 0.0f;
   servoNormalized = 0.0f;
   estimatedServoNormalized = 0.0f;
+  unityServoTarget = 0.0f;
   rackMotionState = RACK_MOTION_IDLE;
   rackMotionStartedMs = 0UL;
 }
@@ -336,6 +440,13 @@ void updateConsumable(float dt)
     return;
   }
 
+  // When Unity is connected it drives the servo directly via "S:" commands.
+  // Only fall back to autonomous arc-time calculation in standalone/offline mode.
+  if (hasRecentUnityCommand())
+  {
+    return;
+  }
+
   if (!isArcActive())
   {
     return;
@@ -356,7 +467,23 @@ void updateConsumable(float dt)
 
 void updateServo(float dt)
 {
-  float targetNormalized = rackMotionState == RACK_MOTION_RETURNING_HOME ? 0.0f : servoNormalized;
+  // Determine the target position for the servo:
+  //   - Returning home (electrode change):  0.0
+  //   - Unity connected:                    unityServoTarget  (VR drives physical)
+  //   - Standalone fallback:                servoNormalized   (arc-time estimate)
+  float targetNormalized;
+  if (rackMotionState == RACK_MOTION_RETURNING_HOME)
+  {
+    targetNormalized = 0.0f;
+  }
+  else if (hasRecentUnityCommand())
+  {
+    targetNormalized = unityServoTarget;
+  }
+  else
+  {
+    targetNormalized = servoNormalized;
+  }
 
   if (SERVO_MODE == SERVO_MODE_POSITIONAL)
   {

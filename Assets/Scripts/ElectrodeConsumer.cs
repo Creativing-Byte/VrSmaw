@@ -61,6 +61,10 @@ public class ElectrodeConsumer : MonoBehaviour
     private Material _mat;
     private bool     _ready;
 
+    // Arduino servo sync — send at ~10 Hz so the physical rack mirrors the VR visual
+    private float _servoCmdTimer;
+    private const float ServoCmdIntervalSec = 0.10f;
+
     // weld_t tracking — all in ARco-local space to be immune to XR rig movement
     private Vector3  _initWeldTipLocalPos;   // weld_t.localPosition at start (ARco-local)
     private Vector3  _initTipInArcoLocal;    // cylinder tip position in ARco-local space at start
@@ -173,6 +177,27 @@ public class ElectrodeConsumer : MonoBehaviour
         }
 
         ApplyVisual();
+        SyncServoToArduino();
+    }
+
+    // ── Arduino servo sync ────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Sends the current electrode fraction to the Arduino at 10 Hz so the
+    /// physical rack servo mirrors the VR visual consumption in real time.
+    /// </summary>
+    private void SyncServoToArduino()
+    {
+        _servoCmdTimer -= Time.deltaTime;
+        if (_servoCmdTimer > 0f) return;
+        _servoCmdTimer = ServoCmdIntervalSec;
+
+        var bridge = ArduinoBridgeReceiver.Instance;
+        if (bridge == null) return;
+
+        // Arduino target: 0 = full electrode, 1 = spent.
+        // fractionRemaining: 1 = full, 0 = spent — so we invert.
+        bridge.SendServoTarget(1f - fractionRemaining);
     }
 
     // ── Visual update ─────────────────────────────────────────────────────────
@@ -309,6 +334,10 @@ public class ElectrodeConsumer : MonoBehaviour
         consumedMm  = 0f;
         isSpent     = false;
         _spentTimer = 0f;
+        _servoCmdTimer = 0f;            // send immediately on next Update
         if (_ready) ApplyVisual();
+
+        // Tell the Arduino to home the rack immediately
+        ArduinoBridgeReceiver.Instance?.SendElectrodeReset();
     }
 }

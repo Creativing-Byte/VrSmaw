@@ -59,6 +59,15 @@ public class ArduinoBridgeReceiver : MonoBehaviour
     [Header("UDP")]
     [SerializeField] private int listenPort = 9100;
 
+    [Header("Command Output (Unity → Arduino)")]
+    [Tooltip("Enable sending servo-target commands back to the Arduino.")]
+    [SerializeField] private bool enableCommandOutput = true;
+    [Tooltip("For UDP mode: IP of the PC/bridge that relays UDP commands to the Arduino via Serial. " +
+             "Leave empty to disable UDP command output.")]
+    [SerializeField] private string commandTargetIp = "";
+    [Tooltip("UDP port on the bridge PC that listens for commands from Unity.")]
+    [SerializeField] private int commandTargetPort = 9101;
+
     [Header("Diagnostics")]
     [SerializeField] private bool verboseLogging;
     [SerializeField] private string latestRawPayload;
@@ -75,11 +84,19 @@ public class ArduinoBridgeReceiver : MonoBehaviour
     public event Action<WeldSensorTelemetry> TelemetryUpdated;
 
     private readonly object _payloadLock = new object();
+    private readonly object _sendLock    = new object();
+    private readonly System.Collections.Generic.Queue<string> _sendQueue
+        = new System.Collections.Generic.Queue<string>(16);
+
     private Thread _workerThread;
     private UdpClient _udpClient;
+    private UdpClient _udpSender;
     private bool _keepRunning;
     private bool _hasPendingPayload;
     private string _pendingPayload;
+
+    // Accessible from main thread for serial writes (set/cleared by ReceiveSerialLoop)
+    private volatile SerialPortProxy _activeSerialPort;
 
     private void Awake()
     {
@@ -101,8 +118,89 @@ public class ArduinoBridgeReceiver : MonoBehaviour
         }
     }
 
+    // ── Public command API ────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Tell the Arduino where to position the electrode rack (0 = full, 1 = spent).
+    /// Maps directly to the physical servo position so the hardware mirrors the VR
+    /// electrode visual.  Safe to call every frame — internally throttled via queue.
+    /// </summary>
+    public void SendServoTarget(float normalized)
+    {
+        if (!enableCommandOutput) return;
+        normalized = Mathf.Clamp01(normalized);
+        EnqueueCommand($"S:{normalized:F3}");
+    }
+
+    /// <summary>Tell the Arduino to home the rack (new electrode inserted).</summary>
+    public void SendElectrodeReset()
+    {
+        if (!enableCommandOutput) return;
+        EnqueueCommand("R");
+    }
+
+    // ── Internal command queue ────────────────────────────────────────────────
+
+    private void EnqueueCommand(string cmd)
+    {
+        lock (_sendLock)
+        {
+            // Keep only the latest command of the same type to avoid queue build-up
+            _sendQueue.Enqueue(cmd);
+            while (_sendQueue.Count > 8)
+                _sendQueue.Dequeue();
+        }
+    }
+
+    private void FlushSendQueue()
+    {
+        string cmd;
+        lock (_sendLock)
+        {
+            if (_sendQueue.Count == 0) return;
+            cmd = _sendQueue.Dequeue();
+        }
+
+        // ── Serial write (Editor / PC build) ──────────────────────────────────
+        // SerialPortProxy.WriteLine appends the NewLine character ("\n") itself,
+        // so pass only the raw command string.
+        var serialPort = _activeSerialPort;
+        if (serialPort != null)
+        {
+            try { serialPort.WriteLine(cmd); }
+            catch (Exception ex)
+            {
+                if (verboseLogging)
+                    Debug.LogWarning($"[ArduinoBridgeReceiver] Serial write failed: {ex.Message}");
+            }
+        }
+
+        // ── UDP send (Quest / any platform with a PC bridge relay) ────────────
+        // Include the newline so the Arduino's readline parser terminates correctly.
+        if (!string.IsNullOrEmpty(commandTargetIp))
+        {
+            try
+            {
+                if (_udpSender == null) _udpSender = new UdpClient();
+                var bytes = Encoding.UTF8.GetBytes(cmd + "\n");
+                _udpSender.Send(bytes, bytes.Length, commandTargetIp, commandTargetPort);
+            }
+            catch (Exception ex)
+            {
+                if (verboseLogging)
+                    Debug.LogWarning($"[ArduinoBridgeReceiver] UDP send failed: {ex.Message}");
+            }
+        }
+    }
+
+    // ── Lifecycle ─────────────────────────────────────────────────────────────
+
     private void Update()
     {
+        // ── Flush outgoing command queue first ────────────────────────────────
+        FlushSendQueue();
+
+        // ── Process incoming telemetry ────────────────────────────────────────
         string payload = null;
 
         lock (_payloadLock)
@@ -229,16 +327,11 @@ public class ArduinoBridgeReceiver : MonoBehaviour
         _keepRunning = false;
         activeTransportEndpoint = null;
 
-        try
-        {
-            _udpClient?.Close();
-        }
-        catch
-        {
-            // Ignore cleanup exceptions on shutdown.
-        }
-
+        try { _udpClient?.Close(); } catch { }
         _udpClient = null;
+
+        try { _udpSender?.Close(); } catch { }
+        _udpSender = null;
 
         if (_workerThread != null && _workerThread.IsAlive)
         {
@@ -304,6 +397,7 @@ public class ArduinoBridgeReceiver : MonoBehaviour
                 }
 
                 serialPort = SerialPortProxy.Open(resolvedPortName, serialBaudRate);
+                _activeSerialPort = serialPort;   // expose for main-thread writes
                 activeTransportEndpoint = $"serial://{resolvedPortName}@{serialBaudRate}";
 
                 if (verboseLogging)
@@ -342,6 +436,7 @@ public class ArduinoBridgeReceiver : MonoBehaviour
             }
             finally
             {
+                _activeSerialPort = null;   // no longer writable
                 try
                 {
                     if (serialPort != null && serialPort.IsOpen)
@@ -617,15 +712,19 @@ public class ArduinoBridgeReceiver : MonoBehaviour
         private readonly MethodInfo _openMethod;
         private readonly MethodInfo _closeMethod;
         private readonly MethodInfo _readLineMethod;
+        private readonly MethodInfo _writeLineMethod;
         private readonly PropertyInfo _isOpenProperty;
 
         private SerialPortProxy(object instance)
         {
             _instance = instance;
             var type = instance.GetType();
-            _openMethod = type.GetMethod("Open", BindingFlags.Instance | BindingFlags.Public);
-            _closeMethod = type.GetMethod("Close", BindingFlags.Instance | BindingFlags.Public);
+            _openMethod     = type.GetMethod("Open",     BindingFlags.Instance | BindingFlags.Public);
+            _closeMethod    = type.GetMethod("Close",    BindingFlags.Instance | BindingFlags.Public);
             _readLineMethod = type.GetMethod("ReadLine", BindingFlags.Instance | BindingFlags.Public);
+            _writeLineMethod = type.GetMethod("WriteLine",
+                BindingFlags.Instance | BindingFlags.Public, null,
+                new[] { typeof(string) }, null);
             _isOpenProperty = type.GetProperty("IsOpen", BindingFlags.Instance | BindingFlags.Public);
         }
 
@@ -664,6 +763,11 @@ public class ArduinoBridgeReceiver : MonoBehaviour
         public string ReadLine()
         {
             return _readLineMethod?.Invoke(_instance, null) as string;
+        }
+
+        public void WriteLine(string line)
+        {
+            _writeLineMethod?.Invoke(_instance, new object[] { line });
         }
 
         public void Close()

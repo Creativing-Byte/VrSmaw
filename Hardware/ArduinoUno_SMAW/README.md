@@ -107,10 +107,18 @@ SERVO_MODE_CONTINUOUS_ESTIMATED
 
 Ese modo no conoce posicion real; aproxima la posicion usando tiempo.
 
+Al cambiar de electrodo, el firmware ahora hace esto:
+
+- pone el objetivo del rack en `0`
+- deja que el servo gire en reversa hasta volver a `home`
+- bloquea temporalmente el consumo mientras vuelve
+- solo al terminar aplica el nuevo electrodo y reinicia el consumo logico
+
 Para demo MVP sirve, pero si luego quieren precision real del consumo, lo ideal es:
 
 - cambiar a un servo posicional real, o
 - agregar feedback de posicion
+- agregar un `endstop` / sensor de `home` para que el retorno fisico no dependa solo del tiempo estimado
 
 ## Librerias requeridas
 

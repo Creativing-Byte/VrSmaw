@@ -9,6 +9,12 @@ enum ServoControlMode : uint8_t
   SERVO_MODE_CONTINUOUS_ESTIMATED = 1
 };
 
+enum RackMotionState : uint8_t
+{
+  RACK_MOTION_IDLE = 0,
+  RACK_MOTION_RETURNING_HOME = 1
+};
+
 // ---------------------------------------------------------------------------
 // Hardware config
 // ---------------------------------------------------------------------------
@@ -31,6 +37,7 @@ static const int SERVO_CONTINUOUS_FORWARD_US = 1680;
 static const int SERVO_CONTINUOUS_REVERSE_US = 1320;
 static const float SERVO_CONTINUOUS_TRACK_SECONDS = 8.0f;
 static const float SERVO_CONTINUOUS_DEADBAND = 0.01f;
+static const unsigned long SERVO_POSITIONAL_HOME_SETTLE_MS = 600UL;
 
 // Electrode travel on rack
 static const float MAX_ELECTRODE_TRAVEL_MM = 250.0f;
@@ -80,7 +87,9 @@ bool laserReady = false;
 bool buttonPrevStates[3] = { true, true, true };
 
 uint8_t selectedElectrodeIndex = 0;
+uint8_t requestedElectrodeIndex = 0;
 int pendingElectrodePulse = 0;
+RackMotionState rackMotionState = RACK_MOTION_IDLE;
 
 float pitchDeg = 0.0f;
 float rollDeg = 0.0f;
@@ -94,6 +103,24 @@ float trackingConfidence = 0.0f;
 unsigned long lastTelemetryMs = 0UL;
 unsigned long lastLaserReadMs = 0UL;
 unsigned long lastLoopMicros = 0UL;
+unsigned long rackMotionStartedMs = 0UL;
+
+// ---------------------------------------------------------------------------
+// Forward declarations
+// ---------------------------------------------------------------------------
+
+float computeDeltaSeconds(unsigned long nowMicros);
+void handleElectrodeButtons();
+void requestElectrodeChange(uint8_t index);
+void completeElectrodeChange();
+void updateImu(float dt);
+void updateLaserIfNeeded();
+void updateConsumable(float dt);
+void updateServo(float dt);
+void updateTrackingConfidence();
+void sendTelemetryIfNeeded();
+bool isTriggerPressed();
+bool isArcActive();
 
 // ---------------------------------------------------------------------------
 // Setup
@@ -200,7 +227,7 @@ void handleElectrodeButtons()
   {
     if (buttonStates[i] && !buttonPrevStates[i])
     {
-      selectElectrode(i);
+      requestElectrodeChange(i);
       pendingElectrodePulse = (int)i + 1;
     }
 
@@ -208,17 +235,38 @@ void handleElectrodeButtons()
   }
 }
 
-void selectElectrode(uint8_t index)
+void requestElectrodeChange(uint8_t index)
 {
   if (index >= ELECTRODE_COUNT)
   {
     return;
   }
 
-  selectedElectrodeIndex = index;
+  requestedElectrodeIndex = index;
+  consumedMm = 0.0f;
+  servoNormalized = 0.0f;
+  rackMotionState = RACK_MOTION_RETURNING_HOME;
+  rackMotionStartedMs = millis();
+
+  if (SERVO_MODE == SERVO_MODE_POSITIONAL)
+  {
+    return;
+  }
+
+  if (estimatedServoNormalized <= SERVO_CONTINUOUS_DEADBAND)
+  {
+    completeElectrodeChange();
+  }
+}
+
+void completeElectrodeChange()
+{
+  selectedElectrodeIndex = requestedElectrodeIndex;
   consumedMm = 0.0f;
   servoNormalized = 0.0f;
   estimatedServoNormalized = 0.0f;
+  rackMotionState = RACK_MOTION_IDLE;
+  rackMotionStartedMs = 0UL;
 }
 
 void updateImu(float dt)
@@ -283,6 +331,11 @@ void updateConsumable(float dt)
     return;
   }
 
+  if (rackMotionState != RACK_MOTION_IDLE)
+  {
+    return;
+  }
+
   if (!isArcActive())
   {
     return;
@@ -303,16 +356,28 @@ void updateConsumable(float dt)
 
 void updateServo(float dt)
 {
+  float targetNormalized = rackMotionState == RACK_MOTION_RETURNING_HOME ? 0.0f : servoNormalized;
+
   if (SERVO_MODE == SERVO_MODE_POSITIONAL)
   {
     int targetDeg = SERVO_POSITIONAL_MIN_DEG +
-      (int)((SERVO_POSITIONAL_MAX_DEG - SERVO_POSITIONAL_MIN_DEG) * servoNormalized);
+      (int)((SERVO_POSITIONAL_MAX_DEG - SERVO_POSITIONAL_MIN_DEG) * targetNormalized);
     rackServo.write(targetDeg);
+
+    if (rackMotionState == RACK_MOTION_RETURNING_HOME)
+    {
+      unsigned long elapsedMs = millis() - rackMotionStartedMs;
+      if (elapsedMs >= SERVO_POSITIONAL_HOME_SETTLE_MS)
+      {
+        completeElectrodeChange();
+      }
+    }
+
     return;
   }
 
   // Continuous rotation, estimated by time.
-  float diff = servoNormalized - estimatedServoNormalized;
+  float diff = targetNormalized - estimatedServoNormalized;
   if (diff > SERVO_CONTINUOUS_DEADBAND)
   {
     rackServo.writeMicroseconds(SERVO_CONTINUOUS_FORWARD_US);
@@ -330,6 +395,13 @@ void updateServo(float dt)
 
   if (estimatedServoNormalized < 0.0f) estimatedServoNormalized = 0.0f;
   if (estimatedServoNormalized > 1.0f) estimatedServoNormalized = 1.0f;
+
+  if (rackMotionState == RACK_MOTION_RETURNING_HOME &&
+      estimatedServoNormalized <= SERVO_CONTINUOUS_DEADBAND)
+  {
+    rackServo.writeMicroseconds(SERVO_CONTINUOUS_NEUTRAL_US);
+    completeElectrodeChange();
+  }
 }
 
 void updateTrackingConfidence()
@@ -391,6 +463,11 @@ bool isTriggerPressed()
 
 bool isArcActive()
 {
+  if (rackMotionState != RACK_MOTION_IDLE)
+  {
+    return false;
+  }
+
   if (!isTriggerPressed())
   {
     return false;

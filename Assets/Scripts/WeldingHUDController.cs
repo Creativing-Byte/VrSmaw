@@ -3,12 +3,16 @@ using UnityEngine;
 using UnityEngine.UI;
 
 /// <summary>
-/// Floating World-Space HUD that follows the player's camera and shows
-/// real-time welding feedback: arc state, distance, electrode angle,
-/// arc time, session progress and final score.
+/// Floating World-Space HUD — follows the player's camera and shows
+/// real-time welding feedback with gamified visual indicators:
 ///
-/// Self-contained: builds all UI at runtime, no prefabs needed.
-/// Add this component to any empty GameObject in the scene.
+///   • Arc status + good-arc streak timer
+///   • Distance quality bar (shows the "sweet spot" zone)
+///   • Electrode angle bar  (deviation from 45°)
+///   • Combined quality grade  (ÓPTIMO / BUENO / MEJORAR / FUERA)
+///   • Per-bin seam coverage (10 segments per fillet)
+///   • Bin-fill popup  "✓ +1 sección"
+///   • Arc time · Exercise name
 /// </summary>
 [DisallowMultipleComponent]
 public class WeldingHUDController : MonoBehaviour
@@ -20,47 +24,55 @@ public class WeldingHUDController : MonoBehaviour
     [SerializeField] private WeldingEvaluator evaluator;
 
     [Header("HUD position — camera-relative (metres)")]
-    [Tooltip("How far in front of the camera the HUD floats.")]
-    [SerializeField] private float forwardDist     = 0.55f;
-    [Tooltip("Vertical offset (negative = below eye level).")]
-    [SerializeField] private float verticalOffset  = -0.18f;
-    [Tooltip("Horizontal offset (negative = to the left).")]
+    [SerializeField] private float forwardDist      =  0.55f;
+    [SerializeField] private float verticalOffset   = -0.18f;
     [SerializeField] private float horizontalOffset = -0.15f;
-    [Tooltip("How fast the HUD follows head rotation (higher = snappier).")]
-    [SerializeField] private float followSpeed     = 4f;
+    [SerializeField] private float followSpeed      =  4f;
 
     [Header("Visibility rules")]
-    [SerializeField] private bool showWhenArcActive    = true;
+    [SerializeField] private bool showWhenArcActive     = true;
     [SerializeField] private bool showWhenSessionActive = true;
-
-    // ── Runtime UI references ─────────────────────────────────────────────────
-
-    private Canvas        _canvas;
-    private TMP_Text      _statusText;
-    private TMP_Text      _distText;
-    private TMP_Text      _angleText;
-    private TMP_Text      _scoreText;
-    private TMP_Text      _arcTimeText;
-    private TMP_Text      _progressLabel;
-    private TMP_Text      _exerciseText;
-    private RectTransform _progressFill;
-    private Image         _progressFillImg;
 
     // ── Palette ───────────────────────────────────────────────────────────────
 
-    private static readonly Color CGood = new Color(0.20f, 0.90f, 0.25f, 1f);
-    private static readonly Color CWarn = new Color(1.00f, 0.75f, 0.05f, 1f);
-    private static readonly Color CBad  = new Color(0.90f, 0.18f, 0.08f, 1f);
-    private static readonly Color COff  = new Color(0.50f, 0.50f, 0.55f, 1f);
+    private static readonly Color CGood    = new Color(0.20f, 0.92f, 0.30f, 1f);
+    private static readonly Color CWarn    = new Color(1.00f, 0.78f, 0.05f, 1f);
+    private static readonly Color CBad     = new Color(0.92f, 0.18f, 0.08f, 1f);
+    private static readonly Color COff     = new Color(0.48f, 0.48f, 0.52f, 1f);
+    private static readonly Color CAccentBlue = new Color(0.22f, 0.52f, 1.00f, 1f);
+
+    // ── Runtime UI references ─────────────────────────────────────────────────
+
+    private Canvas      _canvas;
+    private Image       _topAccent;          // colored accent bar (quality driven)
+    private TMP_Text    _statusText;         // arc state
+    private TMP_Text    _streakText;         // 🔥 streak or ⏱ total arc time
+    private TMP_Text    _angleBar;           // angle quality bar + value
+    private TMP_Text    _qualityText;        // combined grade: ÓPTIMO / BUENO / …
+    private TMP_Text    _seamFrenteText;     // per-bin coverage line — Frente
+    private TMP_Text    _seamReversoText;    // per-bin coverage line — Reverso
+    private TMP_Text    _genProgressText;    // generic progress (non P2-T exercises)
+    private TMP_Text    _binPopupText;       // transient "✓ +1 sección" popup
+    private CanvasGroup _binPopupGroup;
+    private TMP_Text    _exerciseText;
+    private RectTransform _progressFill;
+    private Image         _progressFillImg;
 
     // ── State ─────────────────────────────────────────────────────────────────
 
     private Camera _cam;
     private bool   _sessionJustEnded;
     private float  _finalScore;
+    private bool   _forceHidden;
 
-    // ══════════════════════════════════════════════════════════════════════════
-    // Unity lifecycle
+    // Gamification state
+    private float  _goodArcTimer;      // seconds both dist + angle are in ideal range
+    private int    _prevTotalBins;     // detect when a new bin is filled
+    private float  _popupTimer;        // remaining seconds for popup visibility
+
+    private const float PopupDuration  = 1.8f;
+    private const float GoodArcMinSec  = 1.0f;  // show streak only after this threshold
+
     // ══════════════════════════════════════════════════════════════════════════
 
     private void Awake()
@@ -72,14 +84,12 @@ public class WeldingHUDController : MonoBehaviour
         BuildHUD();
         _canvas.gameObject.SetActive(false);
 
-        if (evaluator != null)
-            evaluator.SessionEnded += OnSessionEnded;
+        if (evaluator != null) evaluator.SessionEnded += OnSessionEnded;
     }
 
     private void OnDestroy()
     {
-        if (evaluator != null)
-            evaluator.SessionEnded -= OnSessionEnded;
+        if (evaluator != null) evaluator.SessionEnded -= OnSessionEnded;
     }
 
     private void OnSessionEnded()
@@ -88,13 +98,22 @@ public class WeldingHUDController : MonoBehaviour
         _finalScore       = evaluator != null ? evaluator.OverallScore : 0f;
     }
 
+    public void SetForceHidden(bool hidden)
+    {
+        _forceHidden = hidden;
+        if (hidden && _canvas != null) _canvas.gameObject.SetActive(false);
+    }
+
+    // ── Unity Update ──────────────────────────────────────────────────────────
+
     private void Update()
     {
         if (_cam == null) { _cam = Camera.main; return; }
+        if (_forceHidden) return;
 
         bool arcOn     = migWelding != null && migWelding.ArcIsValid;
         bool sessionOn = evaluator  != null && evaluator.SessionActive;
-        bool visible   = (showWhenArcActive    && arcOn)
+        bool visible   = (showWhenArcActive     && arcOn)
                        || (showWhenSessionActive && sessionOn)
                        || _sessionJustEnded;
 
@@ -109,20 +128,12 @@ public class WeldingHUDController : MonoBehaviour
 
     // ── Camera follow ─────────────────────────────────────────────────────────
 
-private void SmoothFollow()
+    private void SmoothFollow()
     {
         var cam = _cam.transform;
-
-        // Target position: in front of camera, offset down and to the left
         var targetPos = cam.TransformPoint(
             new Vector3(horizontalOffset, verticalOffset, forwardDist));
-
-        // Canvas face toward camera:
-        // Unity WorldSpace Canvas is visible from the side its local +Z points AWAY from.
-        // So +Z must point from canvas toward the scene (away from camera).
         var targetRot = Quaternion.LookRotation(targetPos - cam.position, cam.up);
-
-        // Frame-rate independent exponential smoothing
         float t = 1f - Mathf.Exp(-followSpeed * Time.deltaTime);
         transform.position = Vector3.Lerp(transform.position, targetPos, t);
         transform.rotation = Quaternion.Slerp(transform.rotation, targetRot, t);
@@ -130,150 +141,262 @@ private void SmoothFollow()
 
     // ── Content refresh ───────────────────────────────────────────────────────
 
-private void RefreshContent(bool arcOn, bool sessionOn)
+    private void RefreshContent(bool arcOn, bool sessionOn)
     {
-        // ── Arc status row ────────────────────────────────────────────────────
-        if (arcOn)
-        {
-            _statusText.text  = "●  ARCO ACTIVO";
-            _statusText.color = CGood;
-        }
-        else if (sessionOn)
-        {
-            _statusText.text  = "○  Acercar electrodo";
-            _statusText.color = CWarn;
-        }
-        else if (_sessionJustEnded)
-        {
-            _statusText.text  = "✓  Sesión finalizada";
-            _statusText.color = CGood;
-        }
-        else
-        {
-            _statusText.text  = "○  Sin sesión activa";
-            _statusText.color = COff;
-        }
+        var e = evaluator;
 
-        // ── Distance ──────────────────────────────────────────────────────────
-        float distMm = migWelding != null ? migWelding.CurrentLaserDistanceMm : 0f;
-        if (distMm > 0f)
-        {
-            _distText.text  = $"Distancia   {distMm:F1} mm";
-            _distText.color = arcOn ? CGood : CWarn;
-        }
-        else
-        {
-            _distText.text  = "Distancia   — mm";
-            _distText.color = COff;
-        }
+        // ── Compute quality metrics ───────────────────────────────────────────
 
-        // ── Electrode axis angle from vertical ────────────────────────────────
-        // In SMAW the electrode should be held nearly vertical:
-        // handle high, tip angled ~10-25° from straight down toward the piece.
-        // We compute the physical axis as the vector from the TIP toward the
-        // handle (weld_t parent = ARco = roughly the grip position).
-        // Angle of that axis from Vector3.up:
-        //   0° = handle perfectly above tip (vertical) — good
-        //  10-25° = slight drag angle — ideal SMAW range
-        //  >45° = electrode too flat — bad
+        float angleQuality = 0f;  // 0-1: how well the angle matches 45°
+        float tipAngle     = 0f;
+
         if (migWelding != null && migWelding.weldTip != null)
         {
             var tipPos    = migWelding.weldTip.position;
-            // ARco is the direct parent of weld_t
             var handleRef = migWelding.weldTip.parent != null
                           ? migWelding.weldTip.parent.position
                           : tipPos + Vector3.up;
+            var axis = (handleRef - tipPos).normalized;
+            tipAngle     = Vector3.Angle(axis, Vector3.up);
+            // Ideal 45° for T-joint; perfect = within 5°, degrades to 0 at ±20°
+            float dev    = Mathf.Abs(tipAngle - 45f);
+            angleQuality = arcOn ? 1f - Mathf.Clamp01(dev / 20f) : 0f;
+        }
 
-            var  electrodeAxis = (handleRef - tipPos).normalized;
-            float tilt         = Vector3.Angle(electrodeAxis, Vector3.up);
+        // Quality is purely angle-based (distance removed from scoring and UI)
+        float combinedQ = arcOn ? angleQuality : 0f;
 
-            Color ac;
-            string hint;
-            if (tilt <= 30f)
+        // ── Good-arc streak ───────────────────────────────────────────────────
+
+        if (arcOn && combinedQ >= 0.7f)
+            _goodArcTimer += Time.deltaTime;
+        else if (!arcOn)
+            _goodArcTimer = 0f;
+
+        // ── Bin-fill popup ────────────────────────────────────────────────────
+
+        int totalBins = CountFilledBins(e);
+        if (totalBins > _prevTotalBins && _prevTotalBins >= 0)
+        {
+            _popupTimer = PopupDuration;
+            if (_binPopupText != null)
+                _binPopupText.text = "✓  ¡Sección completada!";
+        }
+        _prevTotalBins = totalBins;
+
+        if (_popupTimer > 0f)
+        {
+            _popupTimer -= Time.deltaTime;
+            float alpha = Mathf.Clamp01(_popupTimer / 0.4f);   // fade out in last 0.4 s
+            if (_binPopupGroup != null) _binPopupGroup.alpha = alpha;
+        }
+        else if (_binPopupGroup != null && _binPopupGroup.alpha > 0f)
+        {
+            _binPopupGroup.alpha = 0f;
+        }
+
+        // ── Accent bar colour ─────────────────────────────────────────────────
+
+        Color accent = arcOn
+            ? Color.Lerp(CBad, CGood, combinedQ)
+            : CAccentBlue;
+        if (_topAccent != null) _topAccent.color = accent;
+
+        // ── Status row ────────────────────────────────────────────────────────
+
+        if (_statusText != null)
+        {
+            if (arcOn)
             {
-                ac   = CGood;
-                hint = "✓";
+                // Pulse size slightly when in optimal zone
+                float szMod = combinedQ >= 0.85f
+                    ? 1f + 0.08f * Mathf.Sin(Time.time * 6f)
+                    : 1f;
+                string sizeTag = combinedQ >= 0.85f
+                    ? $"<size={Mathf.RoundToInt(szMod * 100f)}%>"
+                    : "";
+                string sizeEnd = combinedQ >= 0.85f ? "</size>" : "";
+                _statusText.text  = $"{sizeTag}●  ARCO ACTIVO{sizeEnd}";
+                _statusText.color = Color.Lerp(CWarn, CGood, combinedQ);
             }
-            else if (tilt <= 50f)
+            else if (sessionOn)
             {
-                ac   = CWarn;
-                hint = "↓ inclinar más";
+                _statusText.text  = "○  Acercar electrodo";
+                _statusText.color = CWarn;
+            }
+            else if (_sessionJustEnded)
+            {
+                _statusText.text  = "✓  Sesión finalizada";
+                _statusText.color = CGood;
             }
             else
             {
-                ac   = CBad;
-                hint = "✗ demasiado horizontal";
+                _statusText.text  = "○  Sin sesión activa";
+                _statusText.color = COff;
             }
-
-            _angleText.text  = $"Ángulo elec.  {tilt:F0}°  {hint}";
-            _angleText.color = ac;
-        }
-        else
-        {
-            _angleText.text  = "Ángulo elec.  —°";
-            _angleText.color = COff;
         }
 
-        // ── Evaluator data ────────────────────────────────────────────────────
-        if (evaluator != null)
+        // ── Streak / arc time row ─────────────────────────────────────────────
+
+        if (_streakText != null)
         {
-            // Score: show final value after session ends; live = "en curso"
-            if (_sessionJustEnded || !sessionOn)
+            if (arcOn && _goodArcTimer >= GoodArcMinSec)
             {
-                float s = _sessionJustEnded ? _finalScore : evaluator.OverallScore;
-                _scoreText.text  = $"Puntuación  {s:F0}%";
-                _scoreText.color = s >= 70f ? CGood : s >= 40f ? CWarn : CBad;
+                float pulse = 1f + 0.12f * Mathf.Sin(Time.time * 4f);
+                _streakText.text  = $"<size={Mathf.RoundToInt(pulse * 100f)}%>🔥</size> {_goodArcTimer:F1}s";
+                _streakText.color = CGood;
+            }
+            else if (e != null)
+            {
+                _streakText.text  = $"⏱ {e.ArcActiveSeconds:F1}s";
+                _streakText.color = COff;
+            }
+        }
+
+        // ── Angle bar ─────────────────────────────────────────────────────────
+
+        if (_angleBar != null)
+        {
+            if (migWelding != null && migWelding.weldTip != null)
+            {
+                string bar   = arcOn ? QualityBar(angleQuality, 8) : NeutralBar(8);
+                float  dev   = Mathf.Abs(tipAngle - 45f);
+                Color  ac    = arcOn ? Color.Lerp(CBad, CGood, angleQuality) : COff;
+                string check = arcOn
+                    ? (dev <= 5f  ? " <color=#44EE66>✓</color>"
+                     : dev <= 12f ? " <color=#FFCC22>~</color>"
+                     :              " <color=#FF5555>✗</color>")
+                    : "";
+                _angleBar.text  = $"Ángulo {bar}  {tipAngle:F0}°{check}";
+                _angleBar.color = Color.white;
             }
             else
             {
-                _scoreText.text  = "Puntuación  (al terminar)";
-                _scoreText.color = COff;
+                _angleBar.text  = "Ángulo  —°";
+                _angleBar.color = COff;
             }
-
-            // Arc time
-            float arcSec = evaluator.ArcActiveSeconds;
-            _arcTimeText.text = $"⏱ {arcSec:F1} s";
-
-            // Progress bar + label
-            float prog = evaluator.GetGuidedCompletion01();
-            _progressFill.anchorMax    = new Vector2(prog, 1f);
-            _progressFillImg.color     = Color.Lerp(CWarn, CGood, prog);
-            _progressLabel.text        = $"{evaluator.GetProgressLabel()}  {prog * 100f:F0}%";
-
-            // Exercise name
-            _exerciseText.text = ExerciseLabel(evaluator.Exercise);
         }
-        else
+
+        // ── Combined quality grade ────────────────────────────────────────────
+
+        if (_qualityText != null)
         {
-            _scoreText.text    = "Puntuación  —";
-            _arcTimeText.text  = "⏱ —";
-            _progressLabel.text = "Progreso  —%";
+            if (arcOn)
+            {
+                (string label, Color col) = combinedQ switch
+                {
+                    >= 0.85f => ("ÓPTIMO",   CGood),
+                    >= 0.65f => ("BUENO",    CGood),
+                    >= 0.40f => ("MEJORAR",  CWarn),
+                    _        => ("FUERA",    CBad),
+                };
+                _qualityText.text  = $"Calidad   <b>{label}</b>";
+                _qualityText.color = col;
+            }
+            else
+            {
+                _qualityText.text  = "Calidad   —";
+                _qualityText.color = COff;
+            }
         }
+
+        // ── Coverage rows (P2-T per-bin) ──────────────────────────────────────
+
+        bool isT = e != null && e.Exercise == WeldingEvaluator.ExerciseType.P2_T;
+        float[] perSeam = e?.GetPerSeamCoverages();
+
+        if (_seamFrenteText != null)
+            _seamFrenteText.gameObject.SetActive(isT);
+        if (_seamReversoText != null)
+            _seamReversoText.gameObject.SetActive(isT);
+        if (_genProgressText != null)
+            _genProgressText.gameObject.SetActive(!isT);
+
+        if (isT && perSeam != null && perSeam.Length >= 2)
+        {
+            if (_seamFrenteText  != null) _seamFrenteText.text  = SeamBinBar(perSeam[0], "F");
+            if (_seamReversoText != null) _seamReversoText.text = SeamBinBar(perSeam[1], "R");
+        }
+        else if (isT)
+        {
+            if (_seamFrenteText  != null) { _seamFrenteText.text  = "F  ░░░░░░░░░░  0%";  _seamFrenteText.color  = COff; }
+            if (_seamReversoText != null) { _seamReversoText.text = "R  ░░░░░░░░░░  0%";  _seamReversoText.color = COff; }
+        }
+
+        if (!isT && e != null && _genProgressText != null)
+        {
+            float prog = e.GetGuidedCompletion01();
+            _progressFill.anchorMax = new Vector2(prog, 1f);
+            _progressFillImg.color  = Color.Lerp(CWarn, CGood, prog);
+            _genProgressText.text   = $"{e.GetProgressLabel()}  {prog * 100f:F0}%";
+            _genProgressText.color  = Color.white;
+        }
+
+        // ── Score row ─────────────────────────────────────────────────────────
+
+        if (_sessionJustEnded || !sessionOn)
+        {
+            // (score shown in results panel; nothing extra needed here)
+        }
+
+        // ── Exercise name ─────────────────────────────────────────────────────
+
+        if (_exerciseText != null && e != null)
+            _exerciseText.text = ExerciseLabel(e.Exercise);
     }
 
-    // ── Helpers ───────────────────────────────────────────────────────────────
+    // ── Formatting helpers ────────────────────────────────────────────────────
 
-    private static string ExerciseLabel(WeldingEvaluator.ExerciseType ex)
+    /// <summary>8-char filled/empty quality bar with colour gradient.</summary>
+    private static string QualityBar(float q, int len)
     {
-        switch (ex)
-        {
-            case WeldingEvaluator.ExerciseType.P1_U:        return "P1 · Cordón en U";
-            case WeldingEvaluator.ExerciseType.P2_T:        return "P2 · Ángulo de trabajo T";
-            case WeldingEvaluator.ExerciseType.P3_Cuña:     return "P3 · Cuña";
-            case WeldingEvaluator.ExerciseType.P4_V:        return "P4 · Cordón en V";
-            case WeldingEvaluator.ExerciseType.P5_Cilindro: return "P5 · Cilindro 360°";
-            default:                                         return "—";
-        }
+        int filled = Mathf.Clamp(Mathf.RoundToInt(q * len), 0, len);
+        string col = q >= 0.75f ? "#44EE66" : q >= 0.45f ? "#FFCC22" : "#FF5555";
+        return $"<color={col}>{new string('▮', filled)}</color>" +
+               $"<color=#2A2A2A>{new string('▮', len - filled)}</color>";
     }
+
+    private static string NeutralBar(int len) =>
+        $"<color=#2A2A2A>{new string('▮', len)}</color>";
+
+    /// <summary>10-char per-bin bar for one fillet seam.</summary>
+    private static string SeamBinBar(float coverage, string label)
+    {
+        const int bins = 10;
+        int filled = Mathf.Clamp(Mathf.RoundToInt(coverage * bins), 0, bins);
+        string col = coverage >= 0.8f ? "#44EE66" : coverage >= 0.4f ? "#FFCC22" : "#FF5555";
+        int pct = Mathf.RoundToInt(coverage * 100f);
+        return $"{label}  <color={col}>{new string('█', filled)}</color>" +
+               $"<color=#2A2A2A>{new string('█', bins - filled)}</color>  {pct}%";
+    }
+
+    private static int CountFilledBins(WeldingEvaluator e)
+    {
+        if (e == null) return 0;
+        var seams = e.GetPerSeamCoverages();
+        if (seams == null) return 0;
+        // Count how many 10% increments are filled
+        int count = 0;
+        foreach (var s in seams)
+            count += Mathf.RoundToInt(s * 10f);
+        return count;
+    }
+
+    private static string ExerciseLabel(WeldingEvaluator.ExerciseType ex) => ex switch
+    {
+        WeldingEvaluator.ExerciseType.P2_T => "P2 · Unión en T — filete doble",
+        _                                  => ex.ToString(),
+    };
 
     // ══════════════════════════════════════════════════════════════════════════
-    // HUD construction — all UI built at runtime, no prefabs required
+    // HUD construction
     // ══════════════════════════════════════════════════════════════════════════
 
     private void BuildHUD()
     {
         // ── Root canvas ───────────────────────────────────────────────────────
-        var root   = new GameObject("WeldingHUD_Canvas");
+
+        var root = new GameObject("WeldingHUD_Canvas");
         root.transform.SetParent(transform, false);
 
         _canvas            = root.AddComponent<Canvas>();
@@ -284,62 +407,84 @@ private void RefreshContent(bool arcOn, bool sessionOn)
 
         root.AddComponent<GraphicRaycaster>();
 
-        var cg             = root.AddComponent<CanvasGroup>();
-        cg.interactable    = false;
-        cg.blocksRaycasts  = false;
+        var cg = root.AddComponent<CanvasGroup>();
+        cg.interactable   = false;
+        cg.blocksRaycasts = false;
 
-        // 220 × 180 units at 0.001 scale = 22 cm × 18 cm in world space
-        var rootRT             = root.GetComponent<RectTransform>();
-        rootRT.sizeDelta       = new Vector2(220f, 180f);
-        rootRT.localScale      = Vector3.one * 0.001f;
-        rootRT.localPosition   = Vector3.zero;
-        rootRT.localRotation   = Quaternion.identity;
+        // 220 × 260 units at 0.001 scale = 22 cm × 26 cm
+        var rootRT           = root.GetComponent<RectTransform>();
+        rootRT.sizeDelta     = new Vector2(220f, 260f);
+        rootRT.localScale    = Vector3.one * 0.001f;
+        rootRT.localPosition = Vector3.zero;
+        rootRT.localRotation = Quaternion.identity;
 
         // ── Dark background ───────────────────────────────────────────────────
+
         var bg = MakePanel(root.transform, "BG",
-            Vector2.zero, new Vector2(220f, 180f),
-            new Color(0.04f, 0.04f, 0.07f, 0.90f));
+            Vector2.zero, new Vector2(220f, 260f),
+            new Color(0.04f, 0.04f, 0.07f, 0.92f));
 
-        // Blue accent bar at the top
-        MakePanel(bg.transform, "Accent",
-            new Vector2(0f, 80f), new Vector2(220f, 6f),
-            new Color(0.22f, 0.52f, 1.00f, 0.95f));
+        // ── Top accent bar (quality driven, updated each frame) ───────────────
 
-        // ── Layout: top → bottom, starting just below accent bar ─────────────
-        float y = 58f;
+        var accentGO = MakePanel(bg.transform, "Accent",
+            new Vector2(0f, 120f), new Vector2(220f, 6f),
+            CAccentBlue);
+        _topAccent = accentGO.GetComponent<Image>();
 
-        // STATUS (large, bold)
+        // ── Layout — top-down ─────────────────────────────────────────────────
+
+        float y = 99f;
+
+        // Row 0: Status (large) + streak (right-aligned)
         _statusText = MakeText(bg.transform, "Status",
-            new Vector2(0f, y), new Vector2(210f, 28f),
-            "○  Sin sesión activa", 14f, FontStyles.Bold);
+            new Vector2(-20f, y), new Vector2(140f, 26f),
+            "○  Sin sesión activa", 13f, FontStyles.Bold);
+        _statusText.alignment = TextAlignmentOptions.Left;
+
+        _streakText = MakeText(bg.transform, "Streak",
+            new Vector2(72f, y), new Vector2(70f, 26f),
+            "", 11f, FontStyles.Normal);
+        _streakText.alignment = TextAlignmentOptions.Right;
+        _streakText.color = COff;
+
         y -= 34f;
+        MakeSep(bg.transform, y + 5f);
 
-        MakeSep(bg.transform, y + 4f);
-
-        // DISTANCE
-        _distText = MakeText(bg.transform, "Dist",
-            new Vector2(0f, y), new Vector2(210f, 20f),
-            "Distancia   — mm", 11f, FontStyles.Normal);
-        y -= 22f;
-
-        // ANGLE
-        _angleText = MakeText(bg.transform, "Angle",
-            new Vector2(0f, y), new Vector2(210f, 20f),
-            "Ángulo elec.  —°", 11f, FontStyles.Normal);
-        y -= 22f;
-
-        // SCORE
-        _scoreText = MakeText(bg.transform, "Score",
-            new Vector2(0f, y), new Vector2(210f, 20f),
-            "Puntuación  —", 11f, FontStyles.Normal);
+        // Row 1: Angle bar
+        _angleBar = MakeText(bg.transform, "AngleBar",
+            new Vector2(0f, y), new Vector2(210f, 22f),
+            "Ángulo  —°", 10.5f, FontStyles.Normal);
+        _angleBar.alignment = TextAlignmentOptions.Left;
         y -= 28f;
 
-        MakeSep(bg.transform, y + 4f);
+        MakeSep(bg.transform, y + 5f);
 
-        // PROGRESS BAR
+        // Row 3: Combined quality grade
+        _qualityText = MakeText(bg.transform, "Quality",
+            new Vector2(0f, y), new Vector2(210f, 22f),
+            "Calidad   —", 10.5f, FontStyles.Normal);
+        _qualityText.color = COff;
+        y -= 30f;
+
+        MakeSep(bg.transform, y + 5f);
+
+        // Row 4–5: Per-seam bin coverage (P2-T) OR generic progress bar (others)
+        _seamFrenteText = MakeText(bg.transform, "Frente",
+            new Vector2(0f, y), new Vector2(210f, 22f),
+            "F  ░░░░░░░░░░  0%", 10.5f, FontStyles.Normal);
+        _seamFrenteText.alignment = TextAlignmentOptions.Left;
+        y -= 26f;
+
+        _seamReversoText = MakeText(bg.transform, "Reverso",
+            new Vector2(0f, y), new Vector2(210f, 22f),
+            "R  ░░░░░░░░░░  0%", 10.5f, FontStyles.Normal);
+        _seamReversoText.alignment = TextAlignmentOptions.Left;
+
+        // Generic progress bar (visible only for non-P2T exercises)
         var barBg = MakePanel(bg.transform, "BarBg",
-            new Vector2(0f, y - 8f), new Vector2(196f, 12f),
+            new Vector2(0f, y - 10f), new Vector2(196f, 10f),
             new Color(0.10f, 0.10f, 0.14f, 1f));
+        barBg.gameObject.SetActive(false); // hidden by default; shares y with seam rows
 
         var fillGO           = new GameObject("BarFill");
         fillGO.transform.SetParent(barBg.transform, false);
@@ -352,27 +497,38 @@ private void RefreshContent(bool arcOn, bool sessionOn)
         _progressFill.offsetMax  = Vector2.zero;
         _progressFill.pivot      = new Vector2(0f, 0.5f);
 
+        _genProgressText = MakeText(bg.transform, "GenProg",
+            new Vector2(0f, y), new Vector2(210f, 22f),
+            "Progreso  0%", 10.5f, FontStyles.Normal);
+        _genProgressText.gameObject.SetActive(false);
+
+        y -= 32f;
+        MakeSep(bg.transform, y + 5f);
+
+        // Row 6: Bin popup (normally alpha=0)
+        var popupGO = new GameObject("BinPopup");
+        popupGO.transform.SetParent(bg.transform, false);
+        _binPopupGroup = popupGO.AddComponent<CanvasGroup>();
+        _binPopupGroup.alpha        = 0f;
+        _binPopupGroup.interactable = false;
+        _binPopupGroup.blocksRaycasts = false;
+
+        _binPopupText = MakeText(popupGO.transform, "PopupLabel",
+            new Vector2(0f, y), new Vector2(210f, 22f),
+            "✓  ¡Sección completada!", 10.5f, FontStyles.Bold);
+        _binPopupText.color = CGood;
         y -= 28f;
 
-        // ARC TIME  |  PROGRESS LABEL
-        _arcTimeText = MakeText(bg.transform, "ArcTime",
-            new Vector2(-55f, y), new Vector2(90f, 18f),
-            "⏱ 0.0 s", 10f, FontStyles.Normal);
-        _arcTimeText.alignment = TextAlignmentOptions.Left;
+        MakeSep(bg.transform, y + 5f);
 
-        _progressLabel = MakeText(bg.transform, "ProgLabel",
-            new Vector2(55f, y), new Vector2(90f, 18f),
-            "Progreso  0%", 10f, FontStyles.Normal);
-        _progressLabel.alignment = TextAlignmentOptions.Right;
-        y -= 24f;
-
-        MakeSep(bg.transform, y + 4f);
-
-        // EXERCISE NAME
+        // Row 7: Exercise name (small, dim)
         _exerciseText = MakeText(bg.transform, "Exercise",
-            new Vector2(0f, y - 8f), new Vector2(210f, 18f),
+            new Vector2(0f, y - 6f), new Vector2(210f, 18f),
             "—", 9f, FontStyles.Italic);
-        _exerciseText.color = new Color(0.65f, 0.65f, 0.70f, 1f);
+        _exerciseText.color = new Color(0.60f, 0.60f, 0.65f, 1f);
+
+        // Initialise bin detection
+        _prevTotalBins = -1;
     }
 
     // ── UI factory helpers ────────────────────────────────────────────────────
@@ -404,7 +560,7 @@ private void RefreshContent(bool arcOn, bool sessionOn)
         tmp.fontStyle          = style;
         tmp.color              = Color.white;
         tmp.alignment          = TextAlignmentOptions.Center;
-        tmp.enableWordWrapping = false;
+        tmp.textWrappingMode = TMPro.TextWrappingModes.NoWrap;
         tmp.overflowMode       = TextOverflowModes.Overflow;
         return tmp;
     }
@@ -413,6 +569,6 @@ private void RefreshContent(bool arcOn, bool sessionOn)
     {
         MakePanel(parent, "Sep",
             new Vector2(0f, y), new Vector2(200f, 1f),
-            new Color(1f, 1f, 1f, 0.10f));
+            new Color(1f, 1f, 1f, 0.08f));
     }
 }

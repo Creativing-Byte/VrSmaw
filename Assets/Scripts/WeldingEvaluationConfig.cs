@@ -29,6 +29,16 @@ public class WeldingEvaluationConfig : ScriptableObject
 
         [Tooltip("Laser start-vs-end threshold for cylinder closure in mm (criterion 10)")]
         public float continuityClosureThresholdMm;
+
+        // ── Electrode consumption (used by ElectrodeConsumer) ────────────────
+
+        [Tooltip("Total visual electrode length in mm (capacity unit for the progress bar and 3-D scaling). " +
+                 "Larger electrodes have more material so this should increase with diameter.")]
+        public float totalLengthMm;
+
+        [Tooltip("Rate at which the electrode is consumed while the arc is active (mm per second). " +
+                 "Thicker electrodes melt faster in absolute mm/s but carry more material.")]
+        public float consumptionRateMmPerSec;
     }
 
     // ── Electrode profiles (E6013 3/32\", 1/8\", 5/32\") ──────────────────────

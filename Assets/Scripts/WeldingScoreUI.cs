@@ -44,15 +44,26 @@ public class WeldingScoreUI : MonoBehaviour
     [SerializeField] private TextMeshProUGUI resultsCriteriaText;// scrollable criterion list
     [SerializeField] private Button          resultsCloseButton; // returns to idle
 
+    [Header("Other UIs to hide while Results are shown")]
+    [Tooltip("The floating live HUD — hidden when the results panel is visible.")]
+    [SerializeField] private WeldingHUDController hudController;
+    [Tooltip("The permanent corner status bar — hidden when results are visible.")]
+    [SerializeField] private WeldingHudUI         hudStatusBar;
+
     [Header("Behaviour")]
     [Tooltip("When true the UI updates itself from WeldingEvaluator every frame.")]
     [SerializeField] private bool autoUpdate = true;
+    [Tooltip("Distance in metres the results panel floats in front of the player's camera.")]
+    [SerializeField] private float resultsPanelDistance = 1.1f;
+    [Tooltip("Vertical offset from eye level (negative = slightly below).")]
+    [SerializeField] private float resultsPanelVerticalOffset = -0.05f;
 
     // ── Private state ─────────────────────────────────────────────────────────
 
     private bool _wasSessionActive;
     private ArduinoBridgeReceiver _bridge;
     private string _resultsTitleOverride;
+    private Button _retryButton;   // created programmatically in Awake
 
     // ── Unity lifecycle ───────────────────────────────────────────────────────
 
@@ -64,23 +75,31 @@ public class WeldingScoreUI : MonoBehaviour
     {
         if (evaluator == null)
             evaluator = FindAnyObjectByType<WeldingEvaluator>();
-
         if (selectionMenu == null)
             selectionMenu = FindAnyObjectByType<WeldingSelectionMenu>();
-
         if (flowController == null)
             flowController = FindAnyObjectByType<WeldingTrainingFlowController>();
+        if (hudController == null)
+            hudController = FindAnyObjectByType<WeldingHUDController>();
+        if (hudStatusBar == null)
+            hudStatusBar = FindAnyObjectByType<WeldingHudUI>();
 
         _bridge = ArduinoBridgeReceiver.Instance ?? FindAnyObjectByType<ArduinoBridgeReceiver>();
 
-        if (resultsCloseButton != null)
-            resultsCloseButton.onClick.AddListener(HandleCloseResults);
-
         // Ensure panels have the correct world-space scale.
-        // The scene stores some canvases at scale 0; we normalise here so
-        // SetActive(true) makes them visible without any extra animation.
         EnsureCanvasScale(hudPanel);
         EnsureCanvasScale(resultsPanel);
+
+        // Wire close button (goes to menu / advances sequence)
+        if (resultsCloseButton != null)
+        {
+            var label = resultsCloseButton.GetComponentInChildren<TextMeshProUGUI>();
+            if (label != null) label.text = "MENÚ";
+            resultsCloseButton.onClick.AddListener(HandleCloseResults);
+        }
+
+        // Create REINTENTAR button as a sibling of the close button
+        BuildRetryButton();
 
         Hide();
     }
@@ -90,6 +109,35 @@ public class WeldingScoreUI : MonoBehaviour
         if (panel == null) return;
         if (panel.transform.localScale == Vector3.zero)
             panel.transform.localScale = Vector3.one * CanvasScale;
+    }
+
+    private void BuildRetryButton()
+    {
+        if (resultsCloseButton == null) return;
+
+        // Clone the close button to use its style
+        var retryGO = Instantiate(resultsCloseButton.gameObject,
+                                  resultsCloseButton.transform.parent);
+        retryGO.name = "RetryButton";
+
+        // Position to the LEFT of the close button
+        var origRT  = resultsCloseButton.GetComponent<RectTransform>();
+        var retryRT = retryGO.GetComponent<RectTransform>();
+        retryRT.anchoredPosition = origRT.anchoredPosition
+                                 + new Vector2(-(origRT.sizeDelta.x + 8f), 0f);
+
+        // Label and accent colour
+        var label = retryGO.GetComponentInChildren<TextMeshProUGUI>();
+        if (label != null) label.text = "REINTENTAR";
+        var img = retryGO.GetComponent<Image>();
+        if (img != null) img.color = new Color(0.15f, 0.55f, 0.90f, 1f);
+
+        _retryButton = retryGO.GetComponent<Button>();
+        if (_retryButton != null)
+        {
+            _retryButton.onClick.RemoveAllListeners();
+            _retryButton.onClick.AddListener(HandleRetry);
+        }
     }
 
     private void Update()
@@ -118,12 +166,20 @@ public class WeldingScoreUI : MonoBehaviour
     {
         SetActive(hudPanel,     true);
         SetActive(resultsPanel, false);
+        RestoreOtherUIs();
     }
 
     public void ShowResults()
     {
+        // Anchor the results panel directly in front of the player
+        AnchorResultsToCamera();
+
         SetActive(hudPanel,     false);
         SetActive(resultsPanel, true);
+
+        // Hide everything else so only the results panel is visible
+        HideOtherUIs();
+
         RefreshResults();
     }
 
@@ -131,6 +187,40 @@ public class WeldingScoreUI : MonoBehaviour
     {
         SetActive(hudPanel,     false);
         SetActive(resultsPanel, false);
+        RestoreOtherUIs();
+    }
+
+    // ── Camera anchoring ──────────────────────────────────────────────────────
+
+    private void AnchorResultsToCamera()
+    {
+        if (resultsPanel == null) return;
+        var cam = Camera.main?.transform;
+        if (cam == null) return;
+
+        var t = resultsPanel.transform;
+        t.position = cam.position
+                   + cam.forward * resultsPanelDistance
+                   + cam.up      * resultsPanelVerticalOffset;
+
+        // Face the panel toward the camera
+        var look = t.position - cam.position;
+        if (look.sqrMagnitude > 0.0001f)
+            t.rotation = Quaternion.LookRotation(look.normalized, Vector3.up);
+    }
+
+    // ── Other-UI visibility ───────────────────────────────────────────────────
+
+    private void HideOtherUIs()
+    {
+        if (hudController != null) hudController.SetForceHidden(true);
+        if (hudStatusBar  != null) hudStatusBar.gameObject.SetActive(false);
+    }
+
+    private void RestoreOtherUIs()
+    {
+        if (hudController != null) hudController.SetForceHidden(false);
+        if (hudStatusBar  != null) hudStatusBar.gameObject.SetActive(true);
     }
 
     public void SetResultsTitleOverride(string title)
@@ -166,19 +256,61 @@ public class WeldingScoreUI : MonoBehaviour
             selectionMenu.Show();
     }
 
+    private void HandleRetry()
+    {
+        if (flowController == null)
+            flowController = FindAnyObjectByType<WeldingTrainingFlowController>();
+
+        Hide();
+
+        if (flowController != null && flowController.RetryCurrentExercise())
+            return;
+
+        // Fallback: restart the same session directly
+        if (evaluator != null)
+            evaluator.BeginSession();
+    }
+
     // ── HUD refresh ──────────────────────────────────────────────────────────
 
     private void RefreshHUD()
     {
         if (evaluator == null) return;
 
-        var score = evaluator.OverallScore;
-
-        // Score text + colour
-        if (hudScoreText != null)
+        // ── Score / coverage text ────────────────────────────────────────────
+        // P2-T: show per-seam dwell-coverage instead of overall score.
+        // During a live session all criteria default to 100 % (they are only
+        // finalised at EndSession), so displaying OverallScore would always read
+        // "100 %" and give a completely wrong impression of progress.
+        if (evaluator.Exercise == WeldingEvaluator.ExerciseType.P2_T)
         {
-            hudScoreText.text  = $"{score:F0}<size=60%>%</size>";
-            hudScoreText.color = ScoreColour(score);
+            float[] perSeam = evaluator.GetPerSeamCoverages();
+            if (hudScoreText != null)
+            {
+                if (perSeam != null && perSeam.Length >= 2)
+                {
+                    int pct0 = Mathf.RoundToInt(perSeam[0] * 100f);
+                    int pct1 = Mathf.RoundToInt(perSeam[1] * 100f);
+                    float avg = (perSeam[0] + perSeam[1]) * 50f;   // 0-100
+                    hudScoreText.text  = $"<size=75%>F:</size>{pct0}%  <size=75%>R:</size>{pct1}%";
+                    hudScoreText.color = ScoreColour(avg);
+                }
+                else
+                {
+                    // No coverage data yet — prompt the student to start welding
+                    hudScoreText.text  = "Soldar →";
+                    hudScoreText.color = ColorWarning;
+                }
+            }
+        }
+        else
+        {
+            var score = evaluator.OverallScore;
+            if (hudScoreText != null)
+            {
+                hudScoreText.text  = $"{score:F0}<size=60%>%</size>";
+                hudScoreText.color = ScoreColour(score);
+            }
         }
 
         // Exercise / electrode label

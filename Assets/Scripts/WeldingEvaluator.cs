@@ -193,6 +193,8 @@ private void Update()
 
             AccumulateArcTime(arcActive);
             EvaluateFrame(in t, arcActive, e);
+            if (arcActive && selectedExercise == ExerciseType.P2_T && targetLine != null)
+                TrackSeamVelocityProgress(GetCurrentTipWorldPos());
             _arcWasActive = arcActive;
             UpdateOverallScore(live: true, e);
         }
@@ -231,6 +233,8 @@ private void Update()
 
             AccumulateArcTime(simArc);
             EvaluateFrame(in synth, simArc, e);
+            if (simArc && selectedExercise == ExerciseType.P2_T && targetLine != null)
+                TrackSeamVelocityProgress(GetCurrentTipWorldPos());
             _arcWasActive = simArc;
             UpdateOverallScore(live: true, e);
         }
@@ -278,6 +282,9 @@ public void BeginSession()
         SetApplicableCriteria();
         sessionActive = true;
         _lastSessionEndReason = "En progreso";
+
+        // Clear leftover bead geometry from the previous attempt
+        beadRenderer?.ClearBead();
 
         // Auto-calibrate the controller sensor so the welder's current
         // holding position becomes the zero reference for this session.
@@ -334,17 +341,19 @@ public void BeginSession()
         var electrode = ActiveElectrode;
         if (electrode == null) return 0f;
 
-        // P2-T: progress = fraction of the target seam covered by the bead.
-        // This gives the student direct feedback on how much of the joint they
-        // have welded, rather than a time estimate that ignores positioning.
-        if (selectedExercise == ExerciseType.P2_T
-            && beadRenderer != null && targetLine != null)
+        // P2-T: progress = velocity-gated bin coverage of target seams.
+        // A bin is only marked when the electrode moves at deliberate welding speed
+        // (1.5 – 25 mm/s) along the seam.  Hovering (0 mm/s) and VR tremor
+        // (>>25 mm/s) are both rejected, so only real forward progress counts.
+        if (selectedExercise == ExerciseType.P2_T && targetLine != null)
         {
-            var pts   = beadRenderer.AllWorldPoints;
             var seams = targetLine.Seams;
-            if (pts.Count >= 2 && seams != null && seams.Count > 0)
-                return ComputeSeamCoverage(pts, seams);
-            return 0f;   // no bead points yet
+            if (seams == null || seams.Count == 0) return 0f;
+            if (_seamBinWelded == null)             return 0f;
+            float total = 0f;
+            for (int i = 0; i < seams.Count; i++)
+                total += GetSeamWeldCoverage(i);
+            return total / seams.Count;
         }
 
         var targetArcSeconds = GetGuidedTargetArcSeconds(electrode);
@@ -393,7 +402,10 @@ public void BeginSession()
         if (!_hasArcWork)
             return false;
 
-        if (GetGuidedCompletion01() < 0.995f)
+        // 90 % threshold: 18 of 20 seam bins covered on each fillet (average).
+        // Asking for 99.5 % with discrete bins is impractical — the student would
+        // have to graze the last millimetre of every section.
+        if (GetGuidedCompletion01() < 0.90f)
             return false;
 
         if (_continuousInactiveSeconds < GetGuidedCompletionIdleSeconds())
@@ -427,9 +439,15 @@ public void BeginSession()
         }
 
         // Arc just turned ON (restart after a gap)
+        // For P2_T: ignore pauses longer than 8 s — that duration means the student
+        // was rotating the piece between front and reverso passes, which is correct
+        // technique and must not be counted as a continuity failure.
         if (arcActive && !_arcWasActive && _arcGapTimerMs >= config.continuityPauseThresholdMs)
         {
-            _pauseCount++;
+            bool isRotationPause = selectedExercise == ExerciseType.P2_T
+                                && _arcGapTimerMs > 8000f;
+            if (!isRotationPause)
+                _pauseCount++;
         }
 
         // ── Arc-active processing ────────────────────────────────────────────
@@ -489,11 +507,13 @@ public void BeginSession()
             if (t.pitchDeg > _pitchMax) _pitchMax = t.pitchDeg;
         }
 
-        // ── C11: Arc stability (distance within inner 50 % of valid range) ─────
+        // ── C11: Arc stability (distance within inner 80 % of valid range) ─────
+        // Uses ±40 % of the half-band so the student has a generous "good zone"
+        // while still penalising holding far outside the arc window.
         if (criteriaResults[10].applicable)
         {
             var midMm    = (e.arcMinMm + e.arcMaxMm) * 0.5f;
-            var halfBand = (e.arcMaxMm - e.arcMinMm) * 0.25f; // ±25 % of total band
+            var halfBand = (e.arcMaxMm - e.arcMinMm) * 0.40f; // ±40 % of total band
             if (Mathf.Abs(t.laserDistanceMm - midMm) <= halfBand)
                 _c11StableFrames++;
         }
@@ -608,7 +628,7 @@ public void BeginSession()
         if (c11.applicable)
         {
             c11.score   = 100f * (float)_c11StableFrames / _totalArcFrames;
-            c11.details = $"Arco estable (centro ±25% rango): {_c11StableFrames}/{_totalArcFrames} ({c11.score:F0}%)";
+            c11.details = $"Arco estable (centro ±40% rango): {_c11StableFrames}/{_totalArcFrames} ({c11.score:F0}%)";
         }
 
         // ── P2-T fillet-specific bead geometry criteria ───────────────────────
@@ -652,25 +672,31 @@ public void BeginSession()
                 }
             }
 
-            // C13 – Cobertura del cordón (fraction of seam length covered)
+            // C13 – Cobertura del cordón (velocity-gated bin coverage)
             var c13 = criteriaResults[12];
             if (c13.applicable)
             {
-                float cov = pts.Count >= 2 ? ComputeSeamCoverage(pts, seams) : 0f;
-                // ScoreLinear: 1 - cov increases when coverage drops → score falls
+                float cov = 0f;
+                if (seams != null && _seamBinWelded != null)
+                {
+                    for (int si = 0; si < seams.Count; si++) cov += GetSeamWeldCoverage(si);
+                    cov /= Mathf.Max(1, seams.Count);
+                }
                 c13.score   = ScoreLinear(1f - cov,
                                           1f - config.beadCoverageFullFraction,
                                           1f - config.beadCoverageMinFraction);
                 c13.details = $"Cobertura: {cov * 100f:F0}% del seam";
             }
 
-            // C14 – Velocidad de avance (travel speed)
+            // C14 – Velocidad de avance (travel speed, estimated from coverage)
             var c14 = criteriaResults[13];
             if (c14.applicable)
             {
-                if (pts.Count >= 2 && _arcActiveSeconds > 0.1f)
+                if (_arcActiveSeconds > 0.1f && _seamBinWelded != null && seams != null)
                 {
-                    float cov         = ComputeSeamCoverage(pts, seams);
+                    float cov         = 0f;
+                    for (int si = 0; si < seams.Count; si++) cov += GetSeamWeldCoverage(si);
+                    cov /= Mathf.Max(1, seams.Count);
                     float seamLenM    = GetBestSeamLengthM(seams);
                     float speedMmPerS = (cov * seamLenM * 1000f) / _arcActiveSeconds;
                     float error       = Mathf.Max(0f,
@@ -729,12 +755,17 @@ public void BeginSession()
                 criteriaResults[1].applicable = true;
                 break;
             case ExerciseType.P2_T:
-                criteriaResults[0].applicable  = true;  // C1  Rectitud del cordón (geometric)
+                // Only three criteria matter for the T-joint double-fillet:
+                //   C3  – Ángulo de trabajo 45°   (technique)
+                //   C6  – Continuidad              (arc pauses within each pass)
+                //   C13 – Cobertura del cordón     (amount of seam covered)
+                //
+                // Distance (C11/C12), travel speed (C14), and geometric straightness (C1)
+                // are not scored because VR controller precision makes them unreliable.
+                // C6 is filtered below to ignore the long pause while rotating the piece.
                 criteriaResults[2].applicable  = true;  // C3  Ángulo de trabajo 45°
-                criteriaResults[5].applicable  = true;  // C6  Continuidad (pausas)
-                criteriaResults[11].applicable = true;  // C12 Posición del cordón
+                criteriaResults[5].applicable  = true;  // C6  Continuidad (pausas cortas)
                 criteriaResults[12].applicable = true;  // C13 Cobertura del cordón
-                criteriaResults[13].applicable = true;  // C14 Velocidad de avance
                 break;
             case ExerciseType.P3_Cuña:
                 criteriaResults[3].applicable = true;
@@ -785,6 +816,12 @@ public void BeginSession()
         _arcActiveSeconds = 0f;
         _continuousInactiveSeconds = 0f;
         _hasArcWork = false;
+
+        // Reset P2-T velocity-gated coverage tracking
+        _seamBinWelded      = null;
+        _seamWeldSeamCount  = 0;
+        _velTrackLastPosSet = false;
+        _smoothedVelMmS     = 0f;
 
         foreach (var c in criteriaResults)
         {
@@ -892,6 +929,11 @@ private void EnsureBridge()
 
     private float GetGuidedMaxSessionSeconds(WeldingEvaluationConfig.ElectrodeProfile electrode)
     {
+        // P2-T is coverage-based, not time-based.  Give the student 5 minutes to
+        // weld both seams before the safety time-out kicks in.
+        if (selectedExercise == ExerciseType.P2_T)
+            return 300f;
+
         var target = GetGuidedTargetArcSeconds(electrode);
         return Mathf.Max(12f, target * 2.2f + 8f);
     }
@@ -970,50 +1012,143 @@ private void EnsureBridge()
     /// Returns the fraction of the best-matching seam that the bead covers (0–1).
     /// A bead point is considered "on" the seam if it is within proximityThreshold metres.
     /// </summary>
+    // ComputeSeamCoverage (bead-based) removed — replaced by TrackSeamDwellTime /
+    // GetSeamDwellCoverage which are robust against VR arm tremor.
+
+    // ── Seam velocity-gated weld coverage (P2-T) ─────────────────────────────────
+    //
+    // WHY velocity-gating instead of dwell-time or plain spatial bins:
+    //
+    //   Natural VR arm tremor oscillates the electrode tip ±8-15 cm at 0.5-2 Hz.
+    //   Peak velocity ≈ 2π × 0.10 m × 1 Hz ≈ 630 mm/s.
+    //   Deliberate fillet welding travel speed: 3-8 mm/s.
+    //
+    //   A velocity window [MinWeldVelMmS, MaxWeldVelMmS] lets through ONLY real
+    //   welding motion:
+    //     • Stationary hovering  (0 mm/s)   < MinWeldVelMmS → rejected
+    //     • Deliberate welding   (3-8 mm/s) → inside window  → accepted ✓
+    //     • Tremor / fast moves  (>>25 mm/s) > MaxWeldVelMmS → rejected
+    //
+    //   This makes it physically impossible to fill bins without actual forward
+    //   movement along the seam at a realistic welding pace.
+
+    private const int   SeamWeldBins      = 10;    // 10 × 3 cm sections = 30 cm seam
+    private const float SeamProximityM    = 0.080f; // 80 mm to seam axis  (generous for 45° approach)
+    private const float MinWeldVelMmS     = 1.5f;  // below = hovering / stationary
+    private const float MaxWeldVelMmS     = 25f;   // above = tremor / fast repositioning
+    private const float VelSmoothingAlpha = 0.25f; // EMA smoothing for per-frame velocity
+
+    private bool[,] _seamBinWelded;
+    private int     _seamWeldSeamCount;
+    private Vector3 _velTrackLastPos;
+    private bool    _velTrackLastPosSet;
+    private float   _smoothedVelMmS;
+
     /// <summary>
-    /// Returns the AVERAGE coverage across all seams (0–1).
-    /// Requires the student to weld EVERY seam — completing only one
-    /// gives at most 1/N progress, not 100 %.
+    /// Called every frame the arc is active (P2-T only).
+    /// Computes smoothed velocity along the nearest seam axis and marks the
+    /// corresponding bin as welded only when speed is in the deliberate-welding range.
     /// </summary>
-    private float ComputeSeamCoverage(
-        System.Collections.Generic.IReadOnlyList<Vector3> pts,
-        System.Collections.Generic.IReadOnlyList<WeldTargetLine.SeamSegment> seams)
+    private void TrackSeamVelocityProgress(Vector3 tipWorld)
     {
-        if (pts.Count == 0 || seams == null || seams.Count == 0) return 0f;
-        float total = 0f;
-        for (int i = 0; i < seams.Count; i++)
-            total += ComputeSingleSeamCoverage(pts, seams[i]);
-        return total / seams.Count;
+        if (tipWorld == Vector3.zero) { _velTrackLastPosSet = false; return; }
+        if (targetLine == null) return;
+        var seams = targetLine.Seams;
+        if (seams == null || seams.Count == 0) return;
+
+        // (Re-)initialise bin array if needed
+        if (_seamBinWelded == null || _seamWeldSeamCount != seams.Count)
+        {
+            _seamWeldSeamCount = seams.Count;
+            _seamBinWelded     = new bool[seams.Count, SeamWeldBins];
+        }
+
+        // ── Find nearest seam ─────────────────────────────────────────────────
+        int   nearestSeam = -1;
+        float nearestDist = float.MaxValue;
+        float nearestT    = 0f;
+
+        for (int si = 0; si < seams.Count; si++)
+        {
+            Vector3 ws   = targetLine.transform.TransformPoint(seams[si].start);
+            Vector3 we   = targetLine.transform.TransformPoint(seams[si].end);
+            Vector3 dir  = we - ws;
+            float   len2 = dir.sqrMagnitude;
+            if (len2 < 0.0001f) continue;
+
+            float   t      = Vector3.Dot(tipWorld - ws, dir) / len2;
+            if (t < -0.05f || t > 1.05f) continue;
+
+            Vector3 onSeam = ws + dir * Mathf.Clamp01(t);
+            float   dist   = Vector3.Distance(tipWorld, onSeam);
+            if (dist < nearestDist) { nearestDist = dist; nearestSeam = si; nearestT = t; }
+        }
+
+        // Lost proximity to any seam — reset velocity tracking
+        if (nearestSeam < 0 || nearestDist > SeamProximityM)
+        {
+            _velTrackLastPosSet = false;
+            return;
+        }
+
+        // ── Velocity gate ─────────────────────────────────────────────────────
+        if (_velTrackLastPosSet)
+        {
+            Vector3 ws     = targetLine.transform.TransformPoint(seams[nearestSeam].start);
+            Vector3 we     = targetLine.transform.TransformPoint(seams[nearestSeam].end);
+            Vector3 dir    = (we - ws).normalized;
+
+            // Absolute displacement along the seam axis this frame (mm/s)
+            float dispM    = Mathf.Abs(Vector3.Dot(tipWorld - _velTrackLastPos, dir));
+            float rawMmS   = Time.deltaTime > 0.0001f ? (dispM * 1000f) / Time.deltaTime : 0f;
+
+            // Exponential moving average — low-pass filter to smooth per-frame jitter
+            _smoothedVelMmS = Mathf.Lerp(_smoothedVelMmS, rawMmS, VelSmoothingAlpha);
+
+            // Accept only deliberate welding speed
+            if (_smoothedVelMmS >= MinWeldVelMmS && _smoothedVelMmS <= MaxWeldVelMmS)
+            {
+                int bin = Mathf.Clamp(
+                    Mathf.FloorToInt(Mathf.Clamp01(nearestT) * SeamWeldBins),
+                    0, SeamWeldBins - 1);
+                _seamBinWelded[nearestSeam, bin] = true;
+            }
+        }
+
+        _velTrackLastPos    = tipWorld;
+        _velTrackLastPosSet = true;
+    }
+
+    /// <summary>Returns the velocity-gated weld coverage fraction (0-1) for one seam.</summary>
+    private float GetSeamWeldCoverage(int si)
+    {
+        if (_seamBinWelded == null || si >= _seamWeldSeamCount) return 0f;
+        int filled = 0;
+        for (int b = 0; b < SeamWeldBins; b++)
+            if (_seamBinWelded[si, b]) filled++;
+        return (float)filled / SeamWeldBins;
     }
 
     /// <summary>
-    /// Returns the coverage fraction (0–1) of one specific seam segment.
+    /// Returns the raw weld-tip world position.  Uses the weldTip transform directly
+    /// so velocity is accurate every frame (needed for the velocity gate).
+    /// Falls back to the last bead point if weldTip is unavailable.
     /// </summary>
-    private float ComputeSingleSeamCoverage(
-        System.Collections.Generic.IReadOnlyList<Vector3> pts,
-        WeldTargetLine.SeamSegment seg)
+    private Vector3 GetCurrentTipWorldPos()
     {
-        const float proximityThreshold = 0.025f; // 25 mm world tolerance
+        if (_migWeldingCache == null)
+            _migWeldingCache = FindAnyObjectByType<MigWelding>();
+        if (_migWeldingCache != null && _migWeldingCache.weldTip != null)
+            return _migWeldingCache.weldTip.position;
 
-        Vector3 ws  = targetLine.transform.TransformPoint(seg.start);
-        Vector3 we  = targetLine.transform.TransformPoint(seg.end);
-        Vector3 dir = we - ws;
-        float   len = dir.magnitude;
-        if (len < 0.0001f) return 0f;
-
-        float minT = float.MaxValue, maxT = float.MinValue;
-        foreach (var pt in pts)
+        // Fallback: last bead surface point
+        if (beadRenderer != null && beadRenderer.AllWorldPoints.Count > 0)
         {
-            float t = Vector3.Dot(pt - ws, dir) / (len * len);
-            if (t < -0.1f || t > 1.1f) continue;
-            Vector3 onSeam = ws + dir * Mathf.Clamp01(t);
-            if (Vector3.Distance(pt, onSeam) > proximityThreshold) continue;
-            if (t < minT) minT = t;
-            if (t > maxT) maxT = t;
+            var pts = beadRenderer.AllWorldPoints;
+            return pts[pts.Count - 1];
         }
 
-        if (minT > maxT) return 0f;
-        return Mathf.Clamp01(maxT) - Mathf.Clamp01(minT);
+        return Vector3.zero;
     }
 
     /// <summary>
@@ -1023,14 +1158,12 @@ private void EnsureBridge()
     /// </summary>
     public float[] GetPerSeamCoverages()
     {
-        if (selectedExercise != ExerciseType.P2_T
-            || beadRenderer == null || targetLine == null) return null;
-        var pts   = beadRenderer.AllWorldPoints;
+        if (selectedExercise != ExerciseType.P2_T || targetLine == null) return null;
         var seams = targetLine.Seams;
-        if (pts.Count == 0 || seams == null || seams.Count == 0) return null;
+        if (seams == null || seams.Count == 0 || _seamBinWelded == null) return null;
         var result = new float[seams.Count];
         for (int i = 0; i < seams.Count; i++)
-            result[i] = ComputeSingleSeamCoverage(pts, seams[i]);
+            result[i] = GetSeamWeldCoverage(i);
         return result;
     }
 

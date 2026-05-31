@@ -16,24 +16,30 @@ MonoBehaviour:
   - code: E6013 3/32"
     diameterMm: 2.4
     baseConsumptionSeconds: 47
-    arcMinMm: 2
-    arcMaxMm: 3
+    arcMinMm: 1.5
+    arcMaxMm: 6
     uniformityToleranceMm: 1.5
     continuityClosureThresholdMm: 2
+    totalLengthMm: 200
+    consumptionRateMmPerSec: 2
   - code: E6013 1/8"
     diameterMm: 3.2
     baseConsumptionSeconds: 56
-    arcMinMm: 3
-    arcMaxMm: 4
+    arcMinMm: 2
+    arcMaxMm: 8
     uniformityToleranceMm: 2
     continuityClosureThresholdMm: 3
+    totalLengthMm: 270
+    consumptionRateMmPerSec: 2.5
   - code: E6013 5/32"
     diameterMm: 4
     baseConsumptionSeconds: 89
-    arcMinMm: 4
-    arcMaxMm: 5
+    arcMinMm: 3
+    arcMaxMm: 10
     uniformityToleranceMm: 2.5
     continuityClosureThresholdMm: 4
+    totalLengthMm: 360
+    consumptionRateMmPerSec: 3.2
   straightnessMaxDeviationDeg: 5
   workAngle45Deg: 45
   workAngle45ToleranceDeg: 5

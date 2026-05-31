@@ -23,40 +23,28 @@ public class WeldingSelectionMenu : MonoBehaviour
 {
     // ── Types ─────────────────────────────────────────────────────────────────
 
+    // ── Single-figure setup: only the T-joint is available ───────────────────
+    // All five exercise slots are kept so existing Inspector button arrays still
+    // compile, but only the first entry is exposed to the student.  Buttons
+    // beyond ExerciseOrder.Length are hidden at runtime in WireExerciseButtons().
+
     private static readonly WeldingEvaluator.ExerciseType[] ExerciseOrder =
     {
-        WeldingEvaluator.ExerciseType.P1_U,
         WeldingEvaluator.ExerciseType.P2_T,
-        WeldingEvaluator.ExerciseType.P3_Cuña,
-        WeldingEvaluator.ExerciseType.P4_V,
-        WeldingEvaluator.ExerciseType.P5_Cilindro
     };
 
     private static readonly string[] ExerciseLabels =
     {
-        "P1 – Cordón plano",
         "P2 – Unión en T",
-        "P3 – Cuña (13°)",
-        "P4 – Ranura en V",
-        "P5 – Cilindro"
     };
 
     private static readonly string[] ExerciseDescriptions =
     {
-        "<b>Cordón plano (U)</b>\nRealiza un cordón recto horizontal.\n" +
-        "<size=85%>Evalúa: Rectitud ±5° · Uniformidad de altura</size>",
-
-        "<b>Unión en T (T-joint)</b>\nMantén el electrodo a 45° durante todo el cordón.\n" +
-        "<size=85%>Evalúa: Ángulo de trabajo 45° ±5°</size>",
-
-        "<b>Adaptación de cuña (13°)</b>\nÁngulo de ataque reducido a 13°. Suelda sin pausas.\n" +
-        "<size=85%>Evalúa: Ángulo 13°±3° · Uniformidad · Continuidad</size>",
-
-        "<b>Ranura en V</b>\nCordón continuo. No superes las 2 interrupciones.\n" +
-        "<size=85%>Evalúa: Continuidad del cordón (máx. 2 cortes)</size>",
-
-        "<b>Cordón circunferencial (Cilindro)</b>\nCompleta los 360° y cierra donde empezaste.\n" +
-        "<size=85%>Evalúa: Cierre 360° · Ángulo en curva · Láser inicial/final · Estabilidad arco</size>",
+        "<b>Unión en T · Filete doble</b>\n" +
+        "Suelda los dos cordones de filete de la pieza T:\n" +
+        "primero el <b>frente</b>, luego gira la pieza para el <b>reverso</b>.\n\n" +
+        "<size=85%>Evalúa: Ángulo de trabajo 45° ±5° · Continuidad · " +
+        "Cobertura del seam · Velocidad de avance</size>",
     };
 
     private static readonly string[] ElectrodeLabels =
@@ -329,13 +317,8 @@ private void RefreshElectrodeRow(int physicalHighlight = -1)
                           ? electrodeTexts[_selectedElectrode].text.Replace("\n", " ")
                           : _selectedElectrode.ToString();
 
-        var startLabel = ExerciseLabels[_selectedExercise];
-        var endLabel = ExerciseLabels[ExerciseLabels.Length - 1];
-        var sequenceSummary = _selectedExercise < ExerciseLabels.Length - 1
-            ? $"{startLabel} → {endLabel}"
-            : startLabel;
-
-        statusText.text = $"<b>Listo</b>  ·  E6013 {electrodeName}  ·  Secuencia {sequenceSummary}";
+        // Single-figure setup: always T-joint, no multi-exercise sequence
+        statusText.text = $"<b>Listo para soldar</b>  ·  E6013 {electrodeName}  ·  Unión en T";
     }
 
     private bool AlignMenuToCamera(bool forcePosition)
@@ -392,14 +375,24 @@ private void RefreshElectrodeRow(int physicalHighlight = -1)
         for (int i = 0; i < exerciseButtons.Length; i++)
         {
             if (exerciseButtons[i] == null) continue;
-            int idx = i;
-            exerciseButtons[i].onClick.AddListener(() => SelectExercise(idx));
 
-            if (exerciseTexts != null && idx < exerciseTexts.Length
-                && exerciseTexts[idx] != null
-                && string.IsNullOrWhiteSpace(exerciseTexts[idx].text))
+            if (i < ExerciseOrder.Length)
             {
-                exerciseTexts[idx].text = ExerciseLabels[idx];
+                // Active exercise button — always overwrite the label from code
+                // so Inspector-saved stale text never shows.
+                int idx = i;
+                exerciseButtons[i].onClick.AddListener(() => SelectExercise(idx));
+
+                if (exerciseTexts != null && idx < exerciseTexts.Length
+                    && exerciseTexts[idx] != null)
+                {
+                    exerciseTexts[idx].text = ExerciseLabels[idx];
+                }
+            }
+            else
+            {
+                // Hide buttons for exercises that no longer exist in the single-figure setup
+                exerciseButtons[i].gameObject.SetActive(false);
             }
         }
     }

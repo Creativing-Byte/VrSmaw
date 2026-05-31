@@ -19,25 +19,32 @@ public class ElectrodeConsumer : MonoBehaviour
     // ── Inspector ─────────────────────────────────────────────────────────────
 
     [Header("References")]
-    [SerializeField] private MigWelding migWelding;
+    [SerializeField] private MigWelding      migWelding;
     [Tooltip("The 'Cylinder' child of 'electrodo_a'. Assign explicitly for reliability.")]
-    [SerializeField] private Transform  electrodeCylinder;
+    [SerializeField] private Transform       electrodeCylinder;
     [Tooltip("weld_t — the arc-detection origin. Will be repositioned to match the real tip as the electrode recedes.")]
-    [SerializeField] private Transform  weldTip;
+    [SerializeField] private Transform       weldTip;
+    [Tooltip("Auto-found at runtime. When assigned, consumption rate and total length are " +
+             "read from the active electrode profile in WeldingEvaluationConfig each session.")]
+    [SerializeField] private WeldingEvaluator weldingEvaluator;
 
-    [Header("Consumption")]
-    [Tooltip("mm consumed per second of active arc. Real SMAW ≈ 5 mm/s.")]
-    [SerializeField] [Range(0.1f, 15f)] private float consumptionRateMmPerSec = 5f;
-    [Tooltip("Total consumable length in mm (electrode usable portion).")]
-    [SerializeField] private float totalElectrodeMm = 200f;
+    [Header("Consumption (overridden per-electrode from WeldingEvaluationConfig when evaluator is set)")]
+    [Tooltip("Fallback mm/s if no evaluator profile is found.")]
+    [SerializeField] [Range(0.1f, 15f)] private float consumptionRateMmPerSec = 2.5f;
+    [Tooltip("Fallback total length if no evaluator profile is found.")]
+    [SerializeField] private float totalElectrodeMm = 270f;
     [Tooltip("Seconds to wait before auto-resetting (simulates inserting a new electrode).")]
     [SerializeField] private float changeElectrodeDelaySec = 2.5f;
 
     [Header("Visual colours")]
     [SerializeField] private Color normalColor  = new Color(0.75f, 0.60f, 0.40f);
     [SerializeField] private Color warningColor = new Color(0.90f, 0.20f, 0.05f);
-    [Tooltip("Fraction remaining at which the warning colour kicks in.")]
-    [SerializeField] [Range(0.05f, 0.5f)] private float warningFraction = 0.20f;
+    [Tooltip("Fraction remaining at which the warning colour kicks in on the cylinder.")]
+    [SerializeField] [Range(0.05f, 0.5f)] private float warningFraction = 0.35f;
+
+    [Tooltip("Fraction remaining at which the electrode is considered spent and auto-replaced. " +
+             "Below this point the stub is inside the clamp teeth and cannot weld.")]
+    [SerializeField] [Range(0.05f, 0.40f)] private float spentFraction = 0.20f;
 
     [Header("Debug (read-only)")]
     [SerializeField] private float consumedMm;
@@ -58,6 +65,9 @@ public class ElectrodeConsumer : MonoBehaviour
     private Vector3  _initWeldTipLocalPos;   // weld_t.localPosition at start (ARco-local)
     private Vector3  _initTipInArcoLocal;    // cylinder tip position in ARco-local space at start
 
+    // ── Private ───────────────────────────────────────────────────────────────
+    private int _lastSyncedElectrodeIndex = -1;
+
     // ── Public API ─────────────────────────────────────────────────────────────
     /// <summary>1 = full electrode, 0 = fully spent.</summary>
     public float FractionRemaining => fractionRemaining;
@@ -69,6 +79,10 @@ public class ElectrodeConsumer : MonoBehaviour
         // Auto-find references if not assigned
         if (migWelding == null)
             migWelding = FindAnyObjectByType<MigWelding>();
+        if (weldingEvaluator == null)
+            weldingEvaluator = FindAnyObjectByType<WeldingEvaluator>();
+
+        SyncElectrodeProfile();
 
         if (electrodeCylinder == null)
         {
@@ -123,6 +137,7 @@ public class ElectrodeConsumer : MonoBehaviour
     {
         if (!_ready || migWelding == null) return;
 
+        SyncElectrodeProfile();
         arcActive = migWelding.ArcIsValid;
 
         // ── Spent: wait for electrode-change delay ───────────────────────────
@@ -145,11 +160,15 @@ public class ElectrodeConsumer : MonoBehaviour
             consumedMm = Mathf.Min(consumedMm + consumptionRateMmPerSec * Time.deltaTime,
                                    totalElectrodeMm);
 
-            if (consumedMm >= totalElectrodeMm)
+            // Mark spent at spentFraction remaining (default 20%).
+            // Below that threshold the stub is inside the clamp teeth and cannot
+            // produce a reliable arc, so we simulate an auto electrode change.
+            float remaining = 1f - consumedMm / Mathf.Max(1f, totalElectrodeMm);
+            if (remaining <= spentFraction)
             {
                 isSpent     = true;
                 _spentTimer = changeElectrodeDelaySec;
-                Debug.Log("[ElectrodeConsumer] Electrode fully spent!");
+                Debug.Log($"[ElectrodeConsumer] Electrode spent at {remaining*100f:F0}% remaining — auto-replacing.");
             }
         }
 
@@ -200,6 +219,37 @@ public class ElectrodeConsumer : MonoBehaviour
 
             weldTip.localPosition = _initWeldTipLocalPos + deltaArcoLocal;
         }
+    }
+
+    // ── Per-electrode profile sync ────────────────────────────────────────────
+
+    /// <summary>
+    /// Reads consumption rate and total length from the active electrode profile
+    /// in WeldingEvaluationConfig. Only runs when the electrode index changes.
+    /// </summary>
+    private void SyncElectrodeProfile()
+    {
+        if (weldingEvaluator == null)
+        {
+            weldingEvaluator = FindAnyObjectByType<WeldingEvaluator>();
+            if (weldingEvaluator == null) return;
+        }
+
+        int idx = weldingEvaluator.ElectrodeIndex;
+        if (idx == _lastSyncedElectrodeIndex) return;
+        _lastSyncedElectrodeIndex = idx;
+
+        var profile = weldingEvaluator.ActiveElectrode;
+        if (profile == null) return;
+
+        if (profile.consumptionRateMmPerSec > 0f)
+            consumptionRateMmPerSec = profile.consumptionRateMmPerSec;
+        if (profile.totalLengthMm > 0f)
+            totalElectrodeMm = profile.totalLengthMm;
+
+        Debug.Log($"[ElectrodeConsumer] Synced → {profile.code}: " +
+                  $"{totalElectrodeMm:F0}mm total @ {consumptionRateMmPerSec:F1}mm/s  " +
+                  $"(usable life ≈ {totalElectrodeMm * (1f - spentFraction) / consumptionRateMmPerSec:F0}s)");
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -254,6 +304,8 @@ public class ElectrodeConsumer : MonoBehaviour
     /// <summary>Force-reset to a full electrode (called on new session start).</summary>
     public void ResetElectrode()
     {
+        _lastSyncedElectrodeIndex = -1;  // force re-sync so new electrode profile is applied
+        SyncElectrodeProfile();
         consumedMm  = 0f;
         isSpent     = false;
         _spentTimer = 0f;

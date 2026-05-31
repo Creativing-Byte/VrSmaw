@@ -22,20 +22,18 @@ using UnityEngine.XR.Interaction.Toolkit.Interactables;
 [DisallowMultipleComponent]
 public class WeldingTrainingFlowController : MonoBehaviour
 {
-    // ── Exercise catalogue ────────────────────────────────────────────────────
+    // ── Exercise catalogue — single-figure setup (T-joint only) ──────────────
+    // The app now has one physical piece: Figura T.
+    // All training is P2_T (double-fillet on T-joint).
 
     private static readonly WeldingEvaluator.ExerciseType[] ExerciseOrder =
     {
-        WeldingEvaluator.ExerciseType.P1_U,
         WeldingEvaluator.ExerciseType.P2_T,
-        WeldingEvaluator.ExerciseType.P3_Cuña,
-        WeldingEvaluator.ExerciseType.P4_V,
-        WeldingEvaluator.ExerciseType.P5_Cilindro
     };
 
     private static readonly string[] ExerciseLabels =
     {
-        "P1 Plano", "P2 T", "P3 Cuña", "P4 V", "P5 Cilindro"
+        "P2 · Unión en T"
     };
 
     // ── Inspector — Sequence ──────────────────────────────────────────────────
@@ -50,6 +48,9 @@ public class WeldingTrainingFlowController : MonoBehaviour
     [SerializeField] private float resultsDisplaySeconds      = 4f;
     [SerializeField] private float finalResultsDisplaySeconds = 6f;
     [SerializeField] private bool  autoReturnToMenuAtSequenceEnd = true;
+    [Tooltip("When true the sequence waits for the player to press REINTENTAR or MENÚ " +
+             "before advancing. The auto-advance timer is disabled.")]
+    [SerializeField] private bool  requireUserInputToContinue = true;
 
     [Header("Optional Remediation")]
     [SerializeField] private bool  repeatExerciseOnLowScore;
@@ -82,9 +83,9 @@ public class WeldingTrainingFlowController : MonoBehaviour
     [SerializeField] private float   guideAnchorDelay = 0.4f;
 
     [Header("Exercise → Welding Piece")]
-    [Tooltip("Scene GO name for each exercise (P1→0 … P5→4).")]
+    [Tooltip("Name of the single welding piece GameObject in the scene.")]
     [SerializeField] private string[] exercisePieceNames = {
-        "figura1 (1)", "figura2", "figura3", "figura2", "CILINDRO"
+        "Figura T"
     };
     [SerializeField] private string clampGoName = "Mig";
 
@@ -359,11 +360,16 @@ public class WeldingTrainingFlowController : MonoBehaviour
 
         if (!awaitingAdvance) return;
 
-        transitionTimer += Time.deltaTime;
-        UpdateResultsTitle();
+        // When requireUserInputToContinue the player must press REINTENTAR or MENÚ.
+        // The auto-advance timer is suspended; only button presses drive transitions.
+        if (!requireUserInputToContinue)
+        {
+            transitionTimer += Time.deltaTime;
+            if (transitionTimer >= GetCurrentDisplaySeconds())
+                CompleteTransition();
+        }
 
-        if (transitionTimer >= GetCurrentDisplaySeconds())
-            CompleteTransition();
+        UpdateResultsTitle();
     }
 
     // ── Public sequence API ───────────────────────────────────────────────────
@@ -387,6 +393,20 @@ public class WeldingTrainingFlowController : MonoBehaviour
         if (!guidedModeEnabled || (!sequenceActive && !awaitingAdvance)) return false;
         if (awaitingAdvance) { CompleteTransition(); return true; }
         return sequenceActive;
+    }
+
+    /// <summary>
+    /// Restart the current exercise from the beginning without returning to the menu.
+    /// Returns true if the retry was handled; false if no active sequence exists.
+    /// </summary>
+    public bool RetryCurrentExercise()
+    {
+        if (evaluator == null) return false;
+        awaitingAdvance = false;
+        transitionTimer = 0f;
+        scoreUI?.ClearResultsTitleOverride();
+        StartCurrentExercise();
+        return true;
     }
 
     // ── In-world guide ────────────────────────────────────────────────────────
@@ -548,11 +568,11 @@ public class WeldingTrainingFlowController : MonoBehaviour
                        :                  "5/32\"  (4.0 mm)";
         string pieceGo = ExercisePieceName(ex);
 
-        // Step 0 – pick up right controller (clamp is physically mounted on it)
+        // Step 0 – pick up right controller
         _guideSteps.Add(new GuideStep
         {
             title        = "Toma el control derecho",
-            body         = $"<b>Ejercicio:</b>  {ExName(ex)}\n" +
+            body         = "<b>Ejercicio:</b>  Unión en T — filete doble\n" +
                            $"<b>Electrodo:</b>  E6013  {elLabel}\n\n" +
                            "La pinza de soldadura está montada en el\n" +
                            "<b>control derecho</b>.  Tómalo con tu mano dominante.\n\n" +
@@ -561,83 +581,62 @@ public class WeldingTrainingFlowController : MonoBehaviour
             launchOnNext = false,
         });
 
-        // Step 1 – grab the welding piece
+        // Step 1 – grab the welding piece and position it
         _guideSteps.Add(new GuideStep
         {
-            title        = "Agarra la pieza de trabajo",
-            body         = "El marcador amarillo señala la pieza que necesitas.\n\n" +
-                           "<b>Agárrala con el control izquierdo</b> y colócala\n" +
-                           "sobre la superficie de la mesa en posición de soldadura.\n\n" +
-                           "<b>Se evaluará:</b>\n" + ExCriteria(ex) + "\n\n" +
-                           "<size=85%><color=#AAAAAA>Avanza automáticamente al agarrar la pieza.</color></size>",
+            title        = "Coloca la pieza T en la mesa",
+            body         = "El marcador amarillo señala la pieza T.\n\n" +
+                           "<b>Agárrala con el control izquierdo</b> y apóyala\n" +
+                           "sobre la superficie de la mesa.\n\n" +
+                           "<b>Debes soldar DOS cordones de filete:</b>\n" +
+                           "  1. <b>Frente</b>  — lado del chaflán que te mira\n" +
+                           "  2. <b>Reverso</b> — gira la pieza 180° para este lado\n\n" +
+                           "<b>Criterios:</b>\n" +
+                           "• Ángulo 45° · Continuidad\n" +
+                           "• Cobertura del seam · Velocidad de avance\n\n" +
+                           "<size=85%><color=#AAAAAA>Avanza al agarrar la pieza.</color></size>",
             beaconTarget = pieceGo,
             launchOnNext = false,
         });
 
-        // Step 2 – ready to start
+        // Step 2 – ready to start welding
         _guideSteps.Add(new GuideStep
         {
             title        = "¡Listo para soldar!",
-            body         = "Acerca el electrodo a la pieza hasta que el\n" +
-                           "<color=#33DD55><b>arco se encienda</b></color>  " +
-                           "— el control vibrará al entrar en rango.\n\n" +
-                           "Cuando estés en posición pulsa\n<b>INICIAR SESIÓN</b>.",
+            body         = "Acerca el electrodo al <b>frente</b> de la pieza\n" +
+                           "hasta que el <color=#33DD55><b>arco se encienda</b></color>.\n\n" +
+                           "<b>Orden sugerido:</b>\n" +
+                           "  1. Suelda el <b>frente</b> de izq. a der.\n" +
+                           "  2. Apaga el arco, agarra la pieza\n" +
+                           "     y <b>gírala 180°</b> con el control izq.\n" +
+                           "  3. Suelda el <b>reverso</b> de izq. a der.\n\n" +
+                           "Cuando estés listo pulsa <b>INICIAR SESIÓN</b>.",
             beaconTarget = pieceGo,
             launchOnNext = true,
         });
 
-        // Step 3 – session active (auto-closes when session ends)
+        // Step 3 – session active
         _guideSteps.Add(new GuideStep
         {
             title        = "¡Evaluación en curso!",
             body         = "<color=#33DD55><b>●</b></color>  Arco activo  →  distancia correcta\n" +
                            "<color=#FF5555><b>○</b></color>  Sin arco    →  ajusta la distancia\n\n" +
-                           "<b>Suelda siguiendo la trayectoria del ejercicio.</b>\n" +
-                           "Este panel se cerrará al finalizar.",
-            beaconTarget = "",      // no beacon during active session
+                           "El HUD muestra  <b>F:X%  R:Y%</b> en tiempo real.\n" +
+                           "Solo el avance a <b>1–25 mm/s</b> acumula progreso.\n\n" +
+                           "<size=85%>Este panel se cierra al finalizar la sesión.</size>",
+            beaconTarget = "",
             launchOnNext = false,
         });
     }
 
+    private static string ExName(WeldingEvaluator.ExerciseType ex) => "P2 – Unión en T";
+
     private string ExercisePieceName(WeldingEvaluator.ExerciseType ex)
     {
-        int idx = ex switch
-        {
-            WeldingEvaluator.ExerciseType.P1_U        => 0,
-            WeldingEvaluator.ExerciseType.P2_T        => 1,
-            WeldingEvaluator.ExerciseType.P3_Cuña     => 2,
-            WeldingEvaluator.ExerciseType.P4_V        => 3,
-            WeldingEvaluator.ExerciseType.P5_Cilindro => 4,
-            _                                         => 0,
-        };
-        return (exercisePieceNames != null && idx < exercisePieceNames.Length)
-             ? exercisePieceNames[idx] : "";
+        // Single-figure setup: all exercises use the same T-joint piece.
+        return (exercisePieceNames != null && exercisePieceNames.Length > 0)
+             ? exercisePieceNames[0] : "";
     }
-
-    private static string ExName(WeldingEvaluator.ExerciseType ex) => ex switch
-    {
-        WeldingEvaluator.ExerciseType.P1_U        => "P1 – Cordón plano",
-        WeldingEvaluator.ExerciseType.P2_T        => "P2 – Unión en T",
-        WeldingEvaluator.ExerciseType.P3_Cuña     => "P3 – Cuña (13°)",
-        WeldingEvaluator.ExerciseType.P4_V        => "P4 – Ranura en V",
-        WeldingEvaluator.ExerciseType.P5_Cilindro => "P5 – Cilindro 360°",
-        _                                         => ex.ToString(),
-    };
-
-    private static string ExCriteria(WeldingEvaluator.ExerciseType ex) => ex switch
-    {
-        WeldingEvaluator.ExerciseType.P1_U =>
-            "• Rectitud del cordón  ±5°\n• Uniformidad de altura\n• Continuidad del arco",
-        WeldingEvaluator.ExerciseType.P2_T =>
-            "• Ángulo de trabajo  45° ±5°\n• Continuidad del cordón\n• Estabilidad del arco",
-        WeldingEvaluator.ExerciseType.P3_Cuña =>
-            "• Ángulo de ataque  13° ±3°\n• Uniformidad\n• Sin interrupciones",
-        WeldingEvaluator.ExerciseType.P4_V =>
-            "• Continuidad  (máx. 2 cortes)\n• Distancia al electrodo estable",
-        WeldingEvaluator.ExerciseType.P5_Cilindro =>
-            "• Cierre completo  360°\n• Ángulo en curva adaptado\n• Cierre láser preciso",
-        _ => "• Arco estable y distancia uniforme",
-    };
 
     // ── Sequence internals ────────────────────────────────────────────────────
 
@@ -716,6 +715,16 @@ public class WeldingTrainingFlowController : MonoBehaviour
     private void UpdateResultsTitle()
     {
         if (scoreUI == null) return;
+
+        if (requireUserInputToContinue)
+        {
+            // No countdown — player decides when to continue via buttons
+            scoreUI.SetResultsTitleOverride(HasNextExercise()
+                ? $"RESULTADO  {GetExerciseLabel(currentExerciseIndex)}"
+                : "SECUENCIA COMPLETA");
+            return;
+        }
+
         var left = Mathf.CeilToInt(Mathf.Max(0f, GetCurrentDisplaySeconds() - transitionTimer));
         if (HasNextExercise())
         {

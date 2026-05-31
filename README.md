@@ -132,6 +132,51 @@ Flujo esperado:
 - `Arduino Uno -> USB -> PC`
 - `PC -> Wi‑Fi local -> Quest 3`
 
+### Puertos del Arduino
+
+Pinout actual esperado por el firmware:
+
+- `D2`
+  - botón físico electrodo `1`
+- `D3`
+  - botón físico electrodo `2`
+- `D4`
+  - botón físico electrodo `3`
+- `D5`
+  - botón de `trigger` / sesión activa
+- `D9`
+  - señal del motor / servo que mueve la cremallera
+- `A4`
+  - `SDA` del bus `I2C`
+- `A5`
+  - `SCL` del bus `I2C`
+
+Sensores conectados sobre `I2C`:
+
+- `MPU6050`
+  - `SDA -> A4`
+  - `SCL -> A5`
+  - `VCC -> 5V`
+  - `GND -> GND`
+- `VL53L0X`
+  - `SDA -> A4`
+  - `SCL -> A5`
+  - `VCC -> 5V` o `3.3V` según el módulo
+  - `GND -> GND`
+
+Motor / servo de la cremallera:
+
+- señal de control:
+  - `servo -> D9`
+- alimentación:
+  - usar `5V` externa
+  - unir `GND` de la fuente externa con `GND` del Arduino
+
+Importante:
+
+- no alimentar el servo directamente desde el `5V` del Arduino si la cremallera tiene carga real
+- el `MPU6050` y el `VL53L0X` comparten el mismo bus `I2C`
+
 ---
 
 ## 5. Cómo iniciar el sistema

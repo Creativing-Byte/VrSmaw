@@ -1,0 +1,1053 @@
+using System;
+using System.Text;
+using UnityEngine;
+
+/// <summary>
+/// Evaluates the 11 welding criteria defined in WeldingEvaluationConfig.
+/// Reads sensor data from ArduinoBridgeReceiver each frame while a session is active.
+///
+/// Criteria by exercise:
+///   P1-U       → C1 (straightness), C2 (height uniformity)
+///   P2-T       → C3 (45° work angle)
+///   P3-Cuña    → C4 (13° wedge angle), C5 (uniformity), C6 (continuity pauses)
+///   P4-V       → C7 (bead interruptions)
+///   P5-Cilindro→ C8 (360° closure), C9 (curve angle), C10 (laser closure), C11 (arc control)
+/// </summary>
+[DisallowMultipleComponent]
+public class WeldingEvaluator : MonoBehaviour
+{
+    public event Action SessionStarted;
+    public event Action SessionEnded;
+
+    // ── Types ─────────────────────────────────────────────────────────────────
+
+    public enum ExerciseType
+    {
+        P1_U,
+        P2_T,
+        P3_Cuña,
+        P4_V,
+        P5_Cilindro
+    }
+
+    [Serializable]
+    public class CriterionResult
+    {
+        public int    id;
+        public string name;
+        public bool   applicable;
+        public float  score;      // 0 – 100
+        public string details;
+    }
+
+    // ── Inspector ─────────────────────────────────────────────────────────────
+
+    [Header("Config")]
+    [SerializeField] private WeldingEvaluationConfig config;
+
+    [SerializeField] private int selectedElectrodeIndex;
+
+    [SerializeField] private ExerciseType selectedExercise = ExerciseType.P1_U;
+
+    [Header("References")]
+    [SerializeField] private ArduinoBridgeReceiver bridge;
+
+    [Tooltip("Optional VR controller mounted on the clamp. When tracking, its pitch/roll/yaw "
+           + "override the Arduino IMU fields for all angle-based criteria (C1-C4, C8, C9).")]
+    [SerializeField] private VRControllerWeldSensor controllerSensor;
+
+    [Tooltip("Bead renderer on the scene — used for geometric bead analysis (C12–C14).")]
+    [SerializeField] private WeldBeadRenderer beadRenderer;
+
+    [Tooltip("Target line component on the weldable piece — provides seam segments for C12–C14.")]
+    [SerializeField] private WeldTargetLine targetLine;
+
+    [Header("Session State (read-only)")]
+    [SerializeField] private bool  sessionActive;
+    [SerializeField] private float sessionElapsedSeconds;
+    [SerializeField] private float overallScore = 100f;
+    [SerializeField] private CriterionResult[] criteriaResults;
+
+    // ── Private tracking ─────────────────────────────────────────────────────
+
+    private bool  _arcWasActive;
+    private float _arcGapTimerMs;    // time (ms) the arc has been continuously OFF
+    
+    // Initialisation flags
+    private bool  _initialYawSet;
+    private float _initialYaw;
+
+    private bool  _prevYawSet;
+    private float _prevYaw;
+    private float _cumulativeYaw;    // for C8 (360° bead)
+
+    private bool  _initialLaserSet;
+    private float _initialLaserMm;
+    private float _lastLaserMm;
+
+    // Frame counters
+    private int   _totalArcFrames;
+
+    // C1 – straightness
+    private int _c1ViolFrames;
+
+    // C2 / C5 – laser uniformity (shared mean tracking)
+    private double _laserSum;
+    private int    _laserSamples;
+    private int    _c2ViolFrames;
+    private int    _c5ViolFrames;
+
+    // C3 – 45° angle
+    private int _c3ViolFrames;
+
+    // C4 – 13° angle
+    private int _c4ViolFrames;
+
+    // C6 / C7 – pauses & interruptions (same detection)
+    private int _pauseCount;         // each pause > threshold counted once at arc restart
+
+    // C8 – tracked via _cumulativeYaw
+    // C9 – pitch range
+    private float _pitchMin;
+    private float _pitchMax;
+
+    // C11 – arc stability: frames where distance is within the inner 50 % of the valid range
+    private int _c11StableFrames;
+    private float _arcActiveSeconds;
+    private float _continuousInactiveSeconds;
+    private bool _hasArcWork;
+    private string _lastSessionEndReason = "Pendiente";
+
+    // ── Public accessors ─────────────────────────────────────────────────────
+
+    public bool  SessionActive   => sessionActive;
+    public float OverallScore    => overallScore;
+    public int   ElectrodeIndex  => selectedElectrodeIndex;
+    public ExerciseType Exercise          => selectedExercise;
+    public float        SessionElapsedSeconds => sessionElapsedSeconds;
+    public float        ArcActiveSeconds => _arcActiveSeconds;
+    public float        CurrentInactiveSeconds => _continuousInactiveSeconds;
+    public bool         HasArcWork => _hasArcWork;
+    public string       LastSessionEndReason => _lastSessionEndReason;
+    public WeldingEvaluationConfig.ElectrodeProfile ActiveElectrode =>
+        config?.GetElectrode(selectedElectrodeIndex);
+
+    public CriterionResult GetCriterion(int oneBased) =>
+        (oneBased >= 1 && oneBased <= criteriaResults.Length) ? criteriaResults[oneBased - 1] : null;
+
+    /// <summary>Total number of criteria slots (including exercise-specific ones).</summary>
+    public int CriteriaCount => criteriaResults?.Length ?? 0;
+
+    // ── Unity lifecycle ───────────────────────────────────────────────────────
+
+private void Awake()
+    {
+        EnsureInitialized();
+        EnsureBridge();
+        EnsureControllerSensor();
+    }
+
+private void Update()
+    {
+        if (!sessionActive) return;
+
+        EnsureBridge();
+        if (config == null) return;
+
+        sessionElapsedSeconds += Time.deltaTime;
+
+        var e = config.GetElectrode(selectedElectrodeIndex);
+        if (e == null) return;
+
+        // ── Arduino path ─────────────────────────────────────────────────────
+        if (bridge != null && bridge.TryGetLatest(out var t))
+        {
+            // ── Override Arduino IMU with VR controller sensor when available ─
+            if (controllerSensor != null && controllerSensor.IsTracking)
+            {
+                t.pitchDeg = controllerSensor.PitchDeg;
+                t.rollDeg  = controllerSensor.RollDeg;
+                t.yawDeg   = controllerSensor.YawDeg;
+            }
+
+            var arcActive = t.laserDistanceMm >= e.arcMinMm && t.laserDistanceMm <= e.arcMaxMm;
+
+            // ── Haptic feedback on arc state changes ──────────────────────────
+            if (controllerSensor != null)
+            {
+                if (arcActive && !_arcWasActive)
+                {
+                    controllerSensor.ResetStableArcTimer();
+                    controllerSensor.TriggerArcEntryHaptic();
+                }
+                else if (!arcActive && _arcWasActive)
+                {
+                    controllerSensor.TriggerArcExitHaptic();
+                }
+
+                if (arcActive)
+                    controllerSensor.TickStableArcHaptic();
+                else
+                    controllerSensor.ResetStableArcTimer();
+            }
+
+            AccumulateArcTime(arcActive);
+            EvaluateFrame(in t, arcActive, e);
+            _arcWasActive = arcActive;
+            UpdateOverallScore(live: true, e);
+        }
+        else
+        {
+            // ── Simulated path (no Arduino) ───────────────────────────────────
+            // Derive arc state from MigWelding's physics-based detection so that
+            // _arcActiveSeconds, GetGuidedCompletion01(), and the auto-end logic
+            // all work correctly during simulation / training without hardware.
+            if (_migWeldingCache == null)
+                _migWeldingCache = FindAnyObjectByType<MigWelding>();
+
+            bool simArc = _migWeldingCache != null && _migWeldingCache.ArcIsValid;
+
+            // Synthesise telemetry from the VR controller sensor so EvaluateFrame
+            // can score angle-based criteria (C3) even without Arduino hardware.
+            // If no sensor is tracking, use neutral angle values so angle criteria
+            // are not penalised — only bead-geometry criteria will count.
+            var synth = new ArduinoBridgeReceiver.WeldSensorTelemetry
+            {
+                pitchDeg = (controllerSensor != null && controllerSensor.IsTracking)
+                           ? controllerSensor.PitchDeg
+                           : config.workAngle45Deg,   // neutral: won't penalise C3
+                rollDeg  = (controllerSensor != null && controllerSensor.IsTracking)
+                           ? controllerSensor.RollDeg
+                           : 0f,
+                yawDeg   = (controllerSensor != null && controllerSensor.IsTracking)
+                           ? controllerSensor.YawDeg
+                           : (_prevYawSet ? _prevYaw : 0f),
+                // laserDistanceMm drives arcActive in EvaluateFrame's pause logic.
+                // Set to mid of valid range when arc is on, 0 (= outside range) when off.
+                laserDistanceMm = simArc
+                                  ? (e.arcMinMm + e.arcMaxMm) * 0.5f
+                                  : 0f,
+            };
+
+            AccumulateArcTime(simArc);
+            EvaluateFrame(in synth, simArc, e);
+            _arcWasActive = simArc;
+            UpdateOverallScore(live: true, e);
+        }
+    }
+
+    // Shared arc-time accumulation used by both Arduino and simulated paths.
+    private void AccumulateArcTime(bool arcActive)
+    {
+        if (arcActive)
+        {
+            _arcActiveSeconds          += Time.deltaTime;
+            _continuousInactiveSeconds  = 0f;
+            _hasArcWork                 = true;
+        }
+        else if (_hasArcWork)
+        {
+            _continuousInactiveSeconds += Time.deltaTime;
+        }
+    }
+
+    // Cached MigWelding reference for the simulated path.
+    private MigWelding _migWeldingCache;
+
+    // ── Public API ────────────────────────────────────────────────────────────
+
+    public void SelectElectrode(int index)
+    {
+        EnsureInitialized();
+        if (config == null) return;
+        selectedElectrodeIndex = Mathf.Clamp(index, 0, config.electrodes.Length - 1);
+    }
+
+    public void SelectExercise(ExerciseType exercise)
+    {
+        EnsureInitialized();
+        selectedExercise = exercise;
+        SetApplicableCriteria();
+    }
+
+public void BeginSession()
+    {
+        EnsureInitialized();
+        EnsureControllerSensor();
+        ResetTracking();
+        SetApplicableCriteria();
+        sessionActive = true;
+        _lastSessionEndReason = "En progreso";
+
+        // Auto-calibrate the controller sensor so the welder's current
+        // holding position becomes the zero reference for this session.
+        if (controllerSensor != null && controllerSensor.CalibrateOnSessionStart)
+            controllerSensor.Calibrate();
+
+        SessionStarted?.Invoke();
+    }
+
+    public void EndSession()
+    {
+        EndSession("Sesión finalizada.");
+    }
+
+    public void EndSession(string reason)
+    {
+        EnsureInitialized();
+        sessionActive = false;
+        _lastSessionEndReason = string.IsNullOrWhiteSpace(reason)
+            ? "Sesión finalizada."
+            : reason;
+
+        if (config != null)
+        {
+            FinalizeScores(config.GetElectrode(selectedElectrodeIndex));
+            UpdateOverallScore(live: false, config.GetElectrode(selectedElectrodeIndex));
+        }
+
+        SessionEnded?.Invoke();
+    }
+
+    /// <summary>Human-readable session report.</summary>
+    public string GetReportText()
+    {
+        var e = config?.GetElectrode(selectedElectrodeIndex);
+        var sb = new StringBuilder();
+        sb.AppendLine($"ELECTRODO : {e?.code ?? "—"}  |  EJERCICIO : {selectedExercise}");
+        sb.AppendLine($"PUNTUACION: {overallScore:F1} %   TIEMPO: {sessionElapsedSeconds:F1} s");
+        sb.AppendLine(new string('-', 52));
+
+        foreach (var c in criteriaResults)
+        {
+            if (!c.applicable) continue;
+            var mark = c.score >= 60f ? "✓" : "✗";
+            sb.AppendLine($"  [{mark}] #{c.id,2}  {c.name,-30} {c.score,5:F0}%");
+            sb.AppendLine($"         {c.details}");
+        }
+
+        return sb.ToString();
+    }
+
+    public float GetGuidedCompletion01()
+    {
+        var electrode = ActiveElectrode;
+        if (electrode == null) return 0f;
+
+        // P2-T: progress = fraction of the target seam covered by the bead.
+        // This gives the student direct feedback on how much of the joint they
+        // have welded, rather than a time estimate that ignores positioning.
+        if (selectedExercise == ExerciseType.P2_T
+            && beadRenderer != null && targetLine != null)
+        {
+            var pts   = beadRenderer.AllWorldPoints;
+            var seams = targetLine.Seams;
+            if (pts.Count >= 2 && seams != null && seams.Count > 0)
+                return ComputeSeamCoverage(pts, seams);
+            return 0f;   // no bead points yet
+        }
+
+        var targetArcSeconds = GetGuidedTargetArcSeconds(electrode);
+        var arcProgress = targetArcSeconds > 0.01f
+            ? Mathf.Clamp01(_arcActiveSeconds / targetArcSeconds)
+            : 0f;
+
+        if (selectedExercise != ExerciseType.P5_Cilindro)
+            return arcProgress;
+
+        var yawProgress = Mathf.Clamp01(Mathf.Abs(_cumulativeYaw) / 360f);
+        var closureProgress = 0f;
+        if (_initialLaserSet)
+        {
+            var threshold = Mathf.Max(0.01f, electrode.continuityClosureThresholdMm * 1.5f);
+            var diff = Mathf.Abs(_lastLaserMm - _initialLaserMm);
+            closureProgress = 1f - Mathf.Clamp01(diff / threshold);
+        }
+
+        return Mathf.Clamp01(arcProgress * 0.40f + yawProgress * 0.50f + closureProgress * 0.10f);
+    }
+
+    /// <summary>Human-readable label for what GetGuidedCompletion01 represents.</summary>
+    public string GetProgressLabel()
+    {
+        return selectedExercise == ExerciseType.P2_T ? "Cobertura" : "Progreso";
+    }
+
+    public bool TryGetGuidedAutoEnd(out string reason)
+    {
+        reason = null;
+
+        if (!sessionActive || config == null)
+            return false;
+
+        var electrode = ActiveElectrode;
+        if (electrode == null)
+            return false;
+
+        if (sessionElapsedSeconds >= GetGuidedMaxSessionSeconds(electrode))
+        {
+            reason = "Tiempo máximo alcanzado para este ejercicio.";
+            return true;
+        }
+
+        if (!_hasArcWork)
+            return false;
+
+        if (GetGuidedCompletion01() < 0.995f)
+            return false;
+
+        if (_continuousInactiveSeconds < GetGuidedCompletionIdleSeconds())
+            return false;
+
+        reason = selectedExercise == ExerciseType.P5_Cilindro
+            ? "Recorrido completo detectado en el cilindro."
+            : "Cordón completado. Avanzando al siguiente ejercicio.";
+        return true;
+    }
+
+    // ── Per-frame evaluation ──────────────────────────────────────────────────
+
+    private void EvaluateFrame(
+        in ArduinoBridgeReceiver.WeldSensorTelemetry t,
+        bool arcActive,
+        WeldingEvaluationConfig.ElectrodeProfile e)
+    {
+        // ── Gap / pause tracking ─────────────────────────────────────────────
+        // Arc just turned OFF
+        if (!arcActive && _arcWasActive)
+        {
+            _arcGapTimerMs = 0f;
+        }
+
+        // Arc is OFF, accumulate gap
+        if (!arcActive)
+        {
+            _arcGapTimerMs += Time.deltaTime * 1000f;
+            return; // nothing more to do when not welding
+        }
+
+        // Arc just turned ON (restart after a gap)
+        if (arcActive && !_arcWasActive && _arcGapTimerMs >= config.continuityPauseThresholdMs)
+        {
+            _pauseCount++;
+        }
+
+        // ── Arc-active processing ────────────────────────────────────────────
+        _totalArcFrames++;
+
+        // Initialise reference values on first arc frame
+        if (!_initialYawSet)   { _initialYaw   = t.yawDeg;            _initialYawSet   = true; }
+        if (!_initialLaserSet) { _initialLaserMm = t.laserDistanceMm; _initialLaserSet = true; }
+
+        _lastLaserMm = t.laserDistanceMm;
+
+        // Cumulative yaw (C8)
+        if (_prevYawSet)
+            _cumulativeYaw += Mathf.DeltaAngle(_prevYaw, t.yawDeg);
+        _prevYaw    = t.yawDeg;
+        _prevYawSet = true;
+
+        // ── C1: Rectitud del cordón ──────────────────────────────────────────
+        if (criteriaResults[0].applicable)
+        {
+            if (Mathf.Abs(Mathf.DeltaAngle(_initialYaw, t.yawDeg)) > config.straightnessMaxDeviationDeg)
+                _c1ViolFrames++;
+        }
+
+        // ── C2 / C5: Laser uniformity (running mean) ─────────────────────────
+        _laserSum += t.laserDistanceMm;
+        _laserSamples++;
+        if (_laserSamples > 1)
+        {
+            var mean    = (float)(_laserSum / _laserSamples);
+            var devMm   = Mathf.Abs(t.laserDistanceMm - mean);
+            if (devMm > e.uniformityToleranceMm)
+            {
+                if (criteriaResults[1].applicable) _c2ViolFrames++;
+                if (criteriaResults[4].applicable) _c5ViolFrames++;
+            }
+        }
+
+        // ── C3: Ángulo trabajo 45° ───────────────────────────────────────────
+        if (criteriaResults[2].applicable)
+        {
+            if (Mathf.Abs(t.pitchDeg - config.workAngle45Deg) > config.workAngle45ToleranceDeg)
+                _c3ViolFrames++;
+        }
+
+        // ── C4: Adaptación ángulo 13° ────────────────────────────────────────
+        if (criteriaResults[3].applicable)
+        {
+            if (Mathf.Abs(t.pitchDeg - config.wedgeAngleDeg) > config.wedgeAngleToleranceDeg)
+                _c4ViolFrames++;
+        }
+
+        // ── C9: Pitch range on curve ─────────────────────────────────────────
+        if (criteriaResults[8].applicable)
+        {
+            if (t.pitchDeg < _pitchMin) _pitchMin = t.pitchDeg;
+            if (t.pitchDeg > _pitchMax) _pitchMax = t.pitchDeg;
+        }
+
+        // ── C11: Arc stability (distance within inner 50 % of valid range) ─────
+        if (criteriaResults[10].applicable)
+        {
+            var midMm    = (e.arcMinMm + e.arcMaxMm) * 0.5f;
+            var halfBand = (e.arcMaxMm - e.arcMinMm) * 0.25f; // ±25 % of total band
+            if (Mathf.Abs(t.laserDistanceMm - midMm) <= halfBand)
+                _c11StableFrames++;
+        }
+    }
+
+    // ── Final score computation ───────────────────────────────────────────────
+
+    private void FinalizeScores(WeldingEvaluationConfig.ElectrodeProfile e)
+    {
+        if (_totalArcFrames == 0 || e == null) return;
+
+        float violRate;
+
+        // C1 – Straightness
+        var c1 = criteriaResults[0];
+        if (c1.applicable)
+        {
+            violRate   = (float)_c1ViolFrames / _totalArcFrames;
+            c1.score   = 100f * (1f - violRate);
+            c1.details = $"Muestras fuera de ±{config.straightnessMaxDeviationDeg}°: {_c1ViolFrames}/{_totalArcFrames}";
+        }
+
+        // C2 – Uniformidad altura
+        var c2 = criteriaResults[1];
+        if (c2.applicable)
+        {
+            violRate   = (float)_c2ViolFrames / _totalArcFrames;
+            c2.score   = 100f * (1f - violRate);
+            c2.details = $"Muestras fuera de ±{e.uniformityToleranceMm} mm: {_c2ViolFrames}/{_totalArcFrames}";
+        }
+
+        // C3 – Ángulo trabajo 45°
+        var c3 = criteriaResults[2];
+        if (c3.applicable)
+        {
+            violRate   = (float)_c3ViolFrames / _totalArcFrames;
+            c3.score   = 100f * (1f - violRate);
+            c3.details = $"Muestras fuera de {config.workAngle45Deg}° ±{config.workAngle45ToleranceDeg}°: {_c3ViolFrames}/{_totalArcFrames}";
+        }
+
+        // C4 – Adaptación 13°
+        var c4 = criteriaResults[3];
+        if (c4.applicable)
+        {
+            violRate   = (float)_c4ViolFrames / _totalArcFrames;
+            c4.score   = 100f * (1f - violRate);
+            c4.details = $"Muestras fuera de {config.wedgeAngleDeg}° ±{config.wedgeAngleToleranceDeg}°: {_c4ViolFrames}/{_totalArcFrames}";
+        }
+
+        // C5 – Uniformidad cuña
+        var c5 = criteriaResults[4];
+        if (c5.applicable)
+        {
+            violRate   = (float)_c5ViolFrames / _totalArcFrames;
+            c5.score   = 100f * (1f - violRate);
+            c5.details = $"Muestras fuera de ±{e.uniformityToleranceMm} mm: {_c5ViolFrames}/{_totalArcFrames}";
+        }
+
+        // C6 – Continuidad (pauses)
+        var c6 = criteriaResults[5];
+        if (c6.applicable)
+        {
+            c6.score   = _pauseCount == 0 ? 100f : Mathf.Max(0f, 100f - _pauseCount * config.c6PenaltyPerPause);
+            c6.details = $"Pausas > {config.continuityPauseThresholdMs:F0} ms: {_pauseCount}";
+        }
+
+        // C7 – Interruptions
+        var c7 = criteriaResults[6];
+        if (c7.applicable)
+        {
+            var excess = Mathf.Max(0, _pauseCount - config.maxInterruptionsBeforeFail);
+            c7.score   = excess == 0 ? 100f : Mathf.Max(0f, 100f - excess * config.c7PenaltyPerInterruption);
+            c7.details = $"Interrupciones: {_pauseCount} (límite: {config.maxInterruptionsBeforeFail})";
+        }
+
+        // C8 – Cordón circunferencial 360°
+        var c8 = criteriaResults[7];
+        if (c8.applicable)
+        {
+            var closureErr = Mathf.Abs(Mathf.Abs(_cumulativeYaw) - 360f);
+            c8.score   = closureErr <= config.circumferentialClosureToleranceDeg
+                ? 100f
+                : Mathf.Max(0f, 100f - (closureErr - config.circumferentialClosureToleranceDeg) * 5f);
+            c8.details = $"Rotación acumulada: {_cumulativeYaw:F1}° | Error cierre: {closureErr:F1}° (lím ±{config.circumferentialClosureToleranceDeg}°)";
+        }
+
+        // C9 – Ángulo curva
+        var c9 = criteriaResults[8];
+        if (c9.applicable && _pitchMin < float.MaxValue)
+        {
+            var variation   = _pitchMax - _pitchMin;
+            var limit       = config.curveAngleVariationMaxDeg * 2f;
+            c9.score   = variation <= limit
+                ? 100f
+                : Mathf.Max(0f, 100f - (variation - limit) * 5f);
+            c9.details = $"Variación pitch: {variation:F1}° (lím ±{config.curveAngleVariationMaxDeg}°)";
+        }
+
+        // C10 – Continuidad y cierre (laser start vs end)
+        var c10 = criteriaResults[9];
+        if (c10.applicable && _initialLaserSet)
+        {
+            var diff   = Mathf.Abs(_lastLaserMm - _initialLaserMm);
+            c10.score  = diff <= e.continuityClosureThresholdMm
+                ? 100f
+                : Mathf.Max(0f, 100f - (diff - e.continuityClosureThresholdMm) * 20f);
+            c10.details = $"Diferencia inicio/fin: {diff:F1} mm (lím {e.continuityClosureThresholdMm} mm)";
+        }
+
+        // C11 – Control del arco
+        var c11 = criteriaResults[10];
+        if (c11.applicable)
+        {
+            c11.score   = 100f * (float)_c11StableFrames / _totalArcFrames;
+            c11.details = $"Arco estable (centro ±25% rango): {_c11StableFrames}/{_totalArcFrames} ({c11.score:F0}%)";
+        }
+
+        // ── P2-T fillet-specific bead geometry criteria ───────────────────────
+        if (selectedExercise == ExerciseType.P2_T
+            && beadRenderer != null && targetLine != null && config != null)
+        {
+            var pts  = beadRenderer.AllWorldPoints;
+            var seams = targetLine.Seams;
+
+            // C1 override – geometric bead straightness replaces the yaw-deviation method
+            var c1g = criteriaResults[0];
+            if (c1g.applicable)
+            {
+                if (pts.Count >= 2)
+                {
+                    float devM = ComputeStraightnessDeviation(pts);
+                    c1g.score   = ScoreLinear(devM, config.beadStraightnessPerfectM, config.beadStraightnessFailM);
+                    c1g.details = $"Desviación máx de línea recta: {devM * 1000f:F1} mm";
+                }
+                else
+                {
+                    c1g.score   = 0f;
+                    c1g.details = "Sin datos de cordón";
+                }
+            }
+
+            // C12 – Posición del cordón (average proximity to target seam)
+            var c12 = criteriaResults[11];
+            if (c12.applicable)
+            {
+                if (pts.Count >= 1)
+                {
+                    float avgDev = ComputeAvgSeamDeviation(pts, seams);
+                    c12.score   = ScoreLinear(avgDev, config.beadPositionPerfectM, config.beadPositionFailM);
+                    c12.details = $"Desv. media del cordón al seam: {avgDev * 1000f:F1} mm";
+                }
+                else
+                {
+                    c12.score   = 0f;
+                    c12.details = "Sin datos de cordón";
+                }
+            }
+
+            // C13 – Cobertura del cordón (fraction of seam length covered)
+            var c13 = criteriaResults[12];
+            if (c13.applicable)
+            {
+                float cov = pts.Count >= 2 ? ComputeSeamCoverage(pts, seams) : 0f;
+                // ScoreLinear: 1 - cov increases when coverage drops → score falls
+                c13.score   = ScoreLinear(1f - cov,
+                                          1f - config.beadCoverageFullFraction,
+                                          1f - config.beadCoverageMinFraction);
+                c13.details = $"Cobertura: {cov * 100f:F0}% del seam";
+            }
+
+            // C14 – Velocidad de avance (travel speed)
+            var c14 = criteriaResults[13];
+            if (c14.applicable)
+            {
+                if (pts.Count >= 2 && _arcActiveSeconds > 0.1f)
+                {
+                    float cov         = ComputeSeamCoverage(pts, seams);
+                    float seamLenM    = GetBestSeamLengthM(seams);
+                    float speedMmPerS = (cov * seamLenM * 1000f) / _arcActiveSeconds;
+                    float error       = Mathf.Max(0f,
+                                           Mathf.Abs(speedMmPerS - config.travelSpeedIdealMmPerSec)
+                                           - config.travelSpeedToleranceMmPerSec);
+                    c14.score   = ScoreLinear(error, 0f,
+                                              config.travelSpeedFailMmPerSec
+                                              - config.travelSpeedToleranceMmPerSec);
+                    c14.details = $"Vel. avance: {speedMmPerS:F1} mm/s " +
+                                  $"(ideal {config.travelSpeedIdealMmPerSec:F1}±{config.travelSpeedToleranceMmPerSec:F1})";
+                }
+                else
+                {
+                    c14.score   = 0f;
+                    c14.details = "Sin datos suficientes";
+                }
+            }
+        }
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    private void UpdateOverallScore(bool live, WeldingEvaluationConfig.ElectrodeProfile e)
+    {
+        if (!live) { ComputeAverage(); return; }
+
+        // During the session, derive a lightweight live score from C2/C5/C11
+        // (the criteria that can be meaningfully approximated in real time).
+        // Full accuracy is only guaranteed after EndSession().
+        if (_totalArcFrames == 0) { overallScore = 100f; return; }
+
+        ComputeAverage();
+    }
+
+    private void ComputeAverage()
+    {
+        float sum  = 0f;
+        int   count = 0;
+        foreach (var c in criteriaResults)
+        {
+            if (!c.applicable) continue;
+            sum += c.score;
+            count++;
+        }
+        overallScore = count > 0 ? sum / count : 100f;
+    }
+
+    private void SetApplicableCriteria()
+    {
+        foreach (var c in criteriaResults) c.applicable = false;
+
+        switch (selectedExercise)
+        {
+            case ExerciseType.P1_U:
+                criteriaResults[0].applicable = true;
+                criteriaResults[1].applicable = true;
+                break;
+            case ExerciseType.P2_T:
+                criteriaResults[0].applicable  = true;  // C1  Rectitud del cordón (geometric)
+                criteriaResults[2].applicable  = true;  // C3  Ángulo de trabajo 45°
+                criteriaResults[5].applicable  = true;  // C6  Continuidad (pausas)
+                criteriaResults[11].applicable = true;  // C12 Posición del cordón
+                criteriaResults[12].applicable = true;  // C13 Cobertura del cordón
+                criteriaResults[13].applicable = true;  // C14 Velocidad de avance
+                break;
+            case ExerciseType.P3_Cuña:
+                criteriaResults[3].applicable = true;
+                criteriaResults[4].applicable = true;
+                criteriaResults[5].applicable = true;
+                break;
+            case ExerciseType.P4_V:
+                criteriaResults[6].applicable = true;
+                break;
+            case ExerciseType.P5_Cilindro:
+                criteriaResults[7].applicable  = true;
+                criteriaResults[8].applicable  = true;
+                criteriaResults[9].applicable  = true;
+                criteriaResults[10].applicable = true;
+                break;
+        }
+    }
+
+    private void ResetTracking()
+    {
+        sessionElapsedSeconds = 0f;
+        overallScore          = 100f;
+        _lastSessionEndReason = "En progreso";
+
+        _arcWasActive    = false;
+        _arcGapTimerMs   = 0f;
+        _initialYawSet   = false;
+        _initialYaw      = 0f;
+        _prevYawSet      = false;
+        _prevYaw         = 0f;
+        _cumulativeYaw   = 0f;
+        _initialLaserSet = false;
+        _initialLaserMm  = 0f;
+        _lastLaserMm     = 0f;
+        _totalArcFrames  = 0;
+
+        _c1ViolFrames   = 0;
+        _laserSum       = 0.0;
+        _laserSamples   = 0;
+        _c2ViolFrames   = 0;
+        _c3ViolFrames   = 0;
+        _c4ViolFrames   = 0;
+        _c5ViolFrames   = 0;
+        _pauseCount     = 0;
+        _pitchMin       = float.MaxValue;
+        _pitchMax       = float.MinValue;
+        _c11StableFrames = 0;
+        _arcActiveSeconds = 0f;
+        _continuousInactiveSeconds = 0f;
+        _hasArcWork = false;
+
+        foreach (var c in criteriaResults)
+        {
+            c.score   = 100f;
+            c.details = "Pendiente";
+        }
+    }
+
+    private void InitCriteriaResults()
+    {
+        var names = new[]
+        {
+            "Rectitud del cordón",        // 1
+            "Uniformidad (altura)",        // 2
+            "Ángulo de trabajo 45°",       // 3
+            "Adaptación ángulo 13°",       // 4
+            "Uniformidad cuña",            // 5
+            "Continuidad cuña",            // 6
+            "Continuidad del cordón",      // 7
+            "Cordón circunferencial 360°", // 8
+            "Ángulo de trabajo en curva",  // 9
+            "Continuidad y cierre",        // 10
+            "Control del arco",            // 11
+            "Posición del cordón",         // 12
+            "Cobertura del cordón",        // 13
+            "Velocidad de avance",         // 14
+        };
+
+        criteriaResults = new CriterionResult[14];
+        for (int i = 0; i < 14; i++)
+        {
+            criteriaResults[i] = new CriterionResult
+            {
+                id      = i + 1,
+                name    = names[i],
+                score   = 100f,
+                details = "Pendiente"
+            };
+        }
+    }
+
+private void EnsureBridge()
+    {
+        if (bridge != null) return;
+        bridge = ArduinoBridgeReceiver.Instance ?? FindAnyObjectByType<ArduinoBridgeReceiver>();
+    }
+
+    private void EnsureControllerSensor()
+    {
+        if (controllerSensor != null) return;
+        controllerSensor = FindAnyObjectByType<VRControllerWeldSensor>();
+    }
+
+    private void EnsureInitialized()
+    {
+        if (criteriaResults == null || criteriaResults.Length != 14)
+            InitCriteriaResults();
+    }
+
+    private float GetGuidedTargetArcSeconds(WeldingEvaluationConfig.ElectrodeProfile electrode)
+    {
+        if (electrode == null)
+            return 0f;
+
+        float ratio;
+        float minSeconds;
+        float maxSeconds;
+
+        switch (selectedExercise)
+        {
+            case ExerciseType.P1_U:
+                ratio = 0.18f;
+                minSeconds = 7f;
+                maxSeconds = 18f;
+                break;
+            case ExerciseType.P2_T:
+                ratio = 0.20f;
+                minSeconds = 8f;
+                maxSeconds = 20f;
+                break;
+            case ExerciseType.P3_Cuña:
+                ratio = 0.24f;
+                minSeconds = 10f;
+                maxSeconds = 24f;
+                break;
+            case ExerciseType.P4_V:
+                ratio = 0.27f;
+                minSeconds = 12f;
+                maxSeconds = 28f;
+                break;
+            case ExerciseType.P5_Cilindro:
+                ratio = 0.33f;
+                minSeconds = 15f;
+                maxSeconds = 34f;
+                break;
+            default:
+                ratio = 0.20f;
+                minSeconds = 8f;
+                maxSeconds = 20f;
+                break;
+        }
+
+        return Mathf.Clamp(electrode.baseConsumptionSeconds * ratio, minSeconds, maxSeconds);
+    }
+
+    private float GetGuidedMaxSessionSeconds(WeldingEvaluationConfig.ElectrodeProfile electrode)
+    {
+        var target = GetGuidedTargetArcSeconds(electrode);
+        return Mathf.Max(12f, target * 2.2f + 8f);
+    }
+
+    private float GetGuidedCompletionIdleSeconds()
+    {
+        return selectedExercise == ExerciseType.P5_Cilindro ? 1.5f : 1.0f;
+    }
+
+    // ── Bead geometry helpers ─────────────────────────────────────────────────
+
+    /// <summary>
+    /// Maps a raw value to a 0–100 score.
+    /// Returns 100 when value ≤ perfectAt, 0 when value ≥ failAt, linear in between.
+    /// </summary>
+    private static float ScoreLinear(float value, float perfectAt, float failAt)
+    {
+        if (perfectAt >= failAt) return value <= perfectAt ? 100f : 0f;
+        return Mathf.Clamp01(1f - (value - perfectAt) / (failAt - perfectAt)) * 100f;
+    }
+
+    /// <summary>
+    /// Returns the maximum perpendicular distance from any bead point to the
+    /// straight line connecting the first and last bead point (world metres).
+    /// </summary>
+    private static float ComputeStraightnessDeviation(
+        System.Collections.Generic.IReadOnlyList<Vector3> pts)
+    {
+        if (pts.Count < 2) return 0f;
+        Vector3 lineDir = (pts[pts.Count - 1] - pts[0]).normalized;
+        if (lineDir.sqrMagnitude < 0.001f) return 0f;
+
+        float maxPerp = 0f;
+        Vector3 origin = pts[0];
+        foreach (var pt in pts)
+        {
+            float proj    = Vector3.Dot(pt - origin, lineDir);
+            Vector3 onLine = origin + lineDir * proj;
+            float perp    = Vector3.Distance(pt, onLine);
+            if (perp > maxPerp) maxPerp = perp;
+        }
+        return maxPerp;
+    }
+
+    /// <summary>
+    /// Returns the average world-space distance from each bead point to the
+    /// nearest point on any seam segment (metres).
+    /// </summary>
+    private float ComputeAvgSeamDeviation(
+        System.Collections.Generic.IReadOnlyList<Vector3> pts,
+        System.Collections.Generic.IReadOnlyList<WeldTargetLine.SeamSegment> seams)
+    {
+        if (pts.Count == 0 || seams == null || seams.Count == 0) return float.MaxValue;
+
+        float sum = 0f;
+        foreach (var pt in pts)
+        {
+            float minDist = float.MaxValue;
+            foreach (var seg in seams)
+            {
+                Vector3 ws  = targetLine.transform.TransformPoint(seg.start);
+                Vector3 we  = targetLine.transform.TransformPoint(seg.end);
+                Vector3 dir = we - ws;
+                float   len = dir.magnitude;
+                if (len < 0.0001f) continue;
+                float   t   = Mathf.Clamp01(Vector3.Dot(pt - ws, dir) / (len * len));
+                float   d   = Vector3.Distance(pt, ws + dir * t);
+                if (d < minDist) minDist = d;
+            }
+            if (minDist < float.MaxValue) sum += minDist;
+        }
+        return sum / pts.Count;
+    }
+
+    /// <summary>
+    /// Returns the fraction of the best-matching seam that the bead covers (0–1).
+    /// A bead point is considered "on" the seam if it is within proximityThreshold metres.
+    /// </summary>
+    /// <summary>
+    /// Returns the AVERAGE coverage across all seams (0–1).
+    /// Requires the student to weld EVERY seam — completing only one
+    /// gives at most 1/N progress, not 100 %.
+    /// </summary>
+    private float ComputeSeamCoverage(
+        System.Collections.Generic.IReadOnlyList<Vector3> pts,
+        System.Collections.Generic.IReadOnlyList<WeldTargetLine.SeamSegment> seams)
+    {
+        if (pts.Count == 0 || seams == null || seams.Count == 0) return 0f;
+        float total = 0f;
+        for (int i = 0; i < seams.Count; i++)
+            total += ComputeSingleSeamCoverage(pts, seams[i]);
+        return total / seams.Count;
+    }
+
+    /// <summary>
+    /// Returns the coverage fraction (0–1) of one specific seam segment.
+    /// </summary>
+    private float ComputeSingleSeamCoverage(
+        System.Collections.Generic.IReadOnlyList<Vector3> pts,
+        WeldTargetLine.SeamSegment seg)
+    {
+        const float proximityThreshold = 0.025f; // 25 mm world tolerance
+
+        Vector3 ws  = targetLine.transform.TransformPoint(seg.start);
+        Vector3 we  = targetLine.transform.TransformPoint(seg.end);
+        Vector3 dir = we - ws;
+        float   len = dir.magnitude;
+        if (len < 0.0001f) return 0f;
+
+        float minT = float.MaxValue, maxT = float.MinValue;
+        foreach (var pt in pts)
+        {
+            float t = Vector3.Dot(pt - ws, dir) / (len * len);
+            if (t < -0.1f || t > 1.1f) continue;
+            Vector3 onSeam = ws + dir * Mathf.Clamp01(t);
+            if (Vector3.Distance(pt, onSeam) > proximityThreshold) continue;
+            if (t < minT) minT = t;
+            if (t > maxT) maxT = t;
+        }
+
+        if (minT > maxT) return 0f;
+        return Mathf.Clamp01(maxT) - Mathf.Clamp01(minT);
+    }
+
+    /// <summary>
+    /// Returns per-seam coverage array for P2_T HUD display.
+    /// Index 0 = first seam (front fillet), 1 = second seam (back fillet), etc.
+    /// Returns null when data is unavailable.
+    /// </summary>
+    public float[] GetPerSeamCoverages()
+    {
+        if (selectedExercise != ExerciseType.P2_T
+            || beadRenderer == null || targetLine == null) return null;
+        var pts   = beadRenderer.AllWorldPoints;
+        var seams = targetLine.Seams;
+        if (pts.Count == 0 || seams == null || seams.Count == 0) return null;
+        var result = new float[seams.Count];
+        for (int i = 0; i < seams.Count; i++)
+            result[i] = ComputeSingleSeamCoverage(pts, seams[i]);
+        return result;
+    }
+
+    /// <summary>
+    /// Returns the world-space length (metres) of the longest seam segment.
+    /// </summary>
+    private float GetBestSeamLengthM(
+        System.Collections.Generic.IReadOnlyList<WeldTargetLine.SeamSegment> seams)
+    {
+        float maxLen = 0f;
+        foreach (var seg in seams)
+        {
+            Vector3 ws  = targetLine.transform.TransformPoint(seg.start);
+            Vector3 we  = targetLine.transform.TransformPoint(seg.end);
+            float   len = (we - ws).magnitude;
+            if (len > maxLen) maxLen = len;
+        }
+        return maxLen;
+    }
+}

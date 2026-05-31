@@ -10,10 +10,14 @@ public class SceneTransitionManager : MonoBehaviour
 
     private void Awake()
     {
-        if (singleton && singleton != this)
-            Destroy(singleton);
+        if (singleton != null && singleton != this)
+        {
+            Destroy(gameObject);
+            return;
+        }
 
         singleton = this;
+        DontDestroyOnLoad(gameObject);
     }
 
     public void GoToScene(int sceneIndex)
@@ -35,15 +39,59 @@ public class SceneTransitionManager : MonoBehaviour
         StartCoroutine(GoToSceneAsyncRoutine(sceneIndex));
     }
 
+    public void GoToSceneAsync(string sceneName)
+    {
+        StartCoroutine(GoToSceneAsyncRoutine(sceneName));
+    }
+
     IEnumerator GoToSceneAsyncRoutine(int sceneIndex)
     {
-        fadeScreen.FadeOut();
-        //Launch the new scene
+        float fadeDuration = 0f;
+        if (fadeScreen != null)
+        {
+            fadeScreen.FadeOut();
+            fadeDuration = fadeScreen.fadeDuration;
+        }
+
         AsyncOperation operation = SceneManager.LoadSceneAsync(sceneIndex);
+        if (operation == null)
+        {
+            Debug.LogError($"SceneTransitionManager: no se pudo iniciar carga de escena con índice {sceneIndex}. Verifica que esté en Build Settings.");
+            yield break;
+        }
+
         operation.allowSceneActivation = false;
 
         float timer = 0;
-        while(timer <= fadeScreen.fadeDuration && !operation.isDone)
+        while (timer <= fadeDuration && !operation.isDone)
+        {
+            timer += Time.deltaTime;
+            yield return null;
+        }
+
+        operation.allowSceneActivation = true;
+    }
+
+    IEnumerator GoToSceneAsyncRoutine(string sceneName)
+    {
+        float fadeDuration = 0f;
+        if (fadeScreen != null)
+        {
+            fadeScreen.FadeOut();
+            fadeDuration = fadeScreen.fadeDuration;
+        }
+
+        AsyncOperation operation = SceneManager.LoadSceneAsync(sceneName);
+        if (operation == null)
+        {
+            Debug.LogError($"SceneTransitionManager: no se pudo iniciar carga de escena '{sceneName}'. Verifica que esté en Build Settings.");
+            yield break;
+        }
+
+        operation.allowSceneActivation = false;
+
+        float timer = 0;
+        while (timer <= fadeDuration && !operation.isDone)
         {
             timer += Time.deltaTime;
             yield return null;

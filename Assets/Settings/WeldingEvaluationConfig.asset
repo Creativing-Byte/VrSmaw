@@ -1,0 +1,45 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: e8a41c7939b2f4274adbf845d3352be6, type: 3}
+  m_Name: WeldingEvaluationConfig
+  m_EditorClassIdentifier: Assembly-CSharp::WeldingEvaluationConfig
+  electrodes:
+  - code: E6013 3/32"
+    diameterMm: 2.4
+    baseConsumptionSeconds: 47
+    arcMinMm: 2
+    arcMaxMm: 3
+    uniformityToleranceMm: 1.5
+    continuityClosureThresholdMm: 2
+  - code: E6013 1/8"
+    diameterMm: 3.2
+    baseConsumptionSeconds: 56
+    arcMinMm: 3
+    arcMaxMm: 4
+    uniformityToleranceMm: 2
+    continuityClosureThresholdMm: 3
+  - code: E6013 5/32"
+    diameterMm: 4
+    baseConsumptionSeconds: 89
+    arcMinMm: 4
+    arcMaxMm: 5
+    uniformityToleranceMm: 2.5
+    continuityClosureThresholdMm: 4
+  straightnessMaxDeviationDeg: 5
+  workAngle45Deg: 45
+  workAngle45ToleranceDeg: 5
+  wedgeAngleDeg: 13
+  wedgeAngleToleranceDeg: 3
+  continuityPauseThresholdMs: 500
+  maxInterruptionsBeforeFail: 2
+  circumferentialClosureToleranceDeg: 10
+  curveAngleVariationMaxDeg: 5

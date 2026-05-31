@@ -1,10 +1,13 @@
 using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
+using UnityEngine.SceneManagement;
 using UnityEngine.UI;
 
 public class GameStartMenu : MonoBehaviour
 {
+    private const string DefaultTrainingSceneName = "SampleScene";
+
     [Header("UI Pages")]
     public GameObject mainMenu;
     public GameObject options;
@@ -17,6 +20,13 @@ public class GameStartMenu : MonoBehaviour
     public Button quitButton;
 
     public List<Button> returnButtons;
+
+    [Header("Scene Flow")]
+    [SerializeField]
+    private string trainingSceneName = DefaultTrainingSceneName;
+
+    [SerializeField]
+    private int fallbackSceneIndex = 1;
 
     // Start is called before the first frame update
     void Start()
@@ -43,7 +53,23 @@ public class GameStartMenu : MonoBehaviour
     public void StartGame()
     {
         HideAll();
-        SceneTransitionManager.singleton.GoToSceneAsync(1);
+
+        if (SceneTransitionManager.singleton == null)
+        {
+            Debug.LogError("SceneTransitionManager singleton is missing. Cargando escena directamente.");
+            SceneManager.LoadScene(!string.IsNullOrWhiteSpace(trainingSceneName)
+                ? trainingSceneName
+                : fallbackSceneIndex.ToString());
+            return;
+        }
+
+        if (!string.IsNullOrWhiteSpace(trainingSceneName))
+        {
+            SceneTransitionManager.singleton.GoToSceneAsync(trainingSceneName);
+            return;
+        }
+
+        SceneTransitionManager.singleton.GoToSceneAsync(fallbackSceneIndex);
     }
 
     public void HideAll()

@@ -155,6 +155,7 @@ public class ElectrodeConsumer : MonoBehaviour
                 Debug.Log("[ElectrodeConsumer] New electrode inserted!");
             }
             ApplyVisual();
+            SyncServoToArduino();   // keep Arduino informed even during cooldown
             return;
         }
 
